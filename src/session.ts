@@ -25,6 +25,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { acquireSessionWriteLock } from "./session-write-lock.js";
 
 // ============== 类型定义 ==============
 
@@ -178,6 +179,21 @@ export class SessionManager {
    */
   async append(sessionKey: string, message: Message): Promise<void> {
     const state = await this.ensureState(sessionKey);
+    const toolUses = extractToolUses(message);
+    const toolResultIds = extractToolResultIds(message);
+
+    if (!state.skipToolGuard) {
+      const hasToolResults = toolResultIds.length > 0;
+      if (state.pendingToolUses.size > 0) {
+        const shouldFlushBeforeMessage =
+          !hasToolResults && (toolUses.length === 0 || message.role !== "assistant");
+        const shouldFlushBeforeNewToolUses = toolUses.length > 0;
+        if (shouldFlushBeforeMessage || shouldFlushBeforeNewToolUses) {
+          await this.flushPendingToolResults(sessionKey, state);
+        }
+      }
+    }
+
     const entry: MessageEntry = {
       type: "message",
       id: generateId(state.byId),
@@ -193,6 +209,15 @@ export class SessionManager {
       state.hasAssistant = true;
     }
     await this.persistEntry(state, entry);
+
+    if (!state.skipToolGuard) {
+      for (const id of toolResultIds) {
+        state.pendingToolUses.delete(id);
+      }
+      for (const call of toolUses) {
+        state.pendingToolUses.set(call.id, call.name);
+      }
+    }
   }
 
   /**
@@ -360,6 +385,8 @@ export class SessionManager {
         leafId: null,
         flushed: false,
         hasAssistant: false,
+        pendingToolUses: new Map<string, string | undefined>(),
+        skipToolGuard: false,
       };
     }
 
@@ -371,13 +398,35 @@ export class SessionManager {
     if (!state.hasAssistant) {
       return;
     }
-    if (!state.flushed) {
-      await rewriteSessionFile(state, this.baseDir);
-      state.flushed = true;
+    const lock = await acquireSessionWriteLock({ sessionFile: state.filePath });
+    try {
+      if (!state.flushed) {
+        await rewriteSessionFile(state, this.baseDir, { skipLock: true });
+        state.flushed = true;
+        return;
+      }
+      await fs.mkdir(this.baseDir, { recursive: true });
+      await fs.appendFile(state.filePath, `${JSON.stringify(entry)}\n`);
+    } finally {
+      await lock.release();
+    }
+  }
+
+  private async flushPendingToolResults(sessionKey: string, state: SessionState): Promise<void> {
+    if (state.pendingToolUses.size === 0) {
       return;
     }
-    await fs.mkdir(this.baseDir, { recursive: true });
-    await fs.appendFile(state.filePath, `${JSON.stringify(entry)}\n`);
+    const pending = Array.from(state.pendingToolUses.entries());
+    state.pendingToolUses.clear();
+    state.skipToolGuard = true;
+    try {
+      for (const [id, name] of pending) {
+        const synthetic = createMissingToolResultMessage(id, name);
+        await this.append(sessionKey, synthetic);
+      }
+    } finally {
+      state.skipToolGuard = false;
+    }
   }
 }
 
@@ -390,6 +439,8 @@ type SessionState = {
   leafId: string | null;
   flushed: boolean;
   hasAssistant: boolean;
+  pendingToolUses: Map<string, string | undefined>;
+  skipToolGuard: boolean;
 };
 
 function generateId(byId: { has(id: string): boolean }): string {
@@ -427,6 +478,61 @@ function parseJsonlLines(content: string): unknown[] {
     }
   }
   return entries;
+}
+
+type ToolUseCall = { id: string; name?: string };
+
+function extractToolUses(message: Message): ToolUseCall[] {
+  if (message.role !== "assistant" || !Array.isArray(message.content)) {
+    return [];
+  }
+  const calls: ToolUseCall[] = [];
+  for (const block of message.content) {
+    if (block.type !== "tool_use") {
+      continue;
+    }
+    if (typeof block.id !== "string" || !block.id) {
+      continue;
+    }
+    calls.push({
+      id: block.id,
+      name: typeof block.name === "string" ? block.name : undefined,
+    });
+  }
+  return calls;
+}
+
+function extractToolResultIds(message: Message): string[] {
+  if (!Array.isArray(message.content)) {
+    return [];
+  }
+  const ids: string[] = [];
+  for (const block of message.content) {
+    if (block.type !== "tool_result") {
+      continue;
+    }
+    if (typeof block.tool_use_id !== "string" || !block.tool_use_id) {
+      continue;
+    }
+    ids.push(block.tool_use_id);
+  }
+  return ids;
+}
+
+function createMissingToolResultMessage(toolCallId: string, toolName?: string): Message {
+  const name = toolName ? ` (${toolName})` : "";
+  return {
+    role: "user",
+    content: [
+      {
+        type: "tool_result",
+        tool_use_id: toolCallId,
+        content:
+          `[openclaw-mini] 会话中缺失工具结果，已插入合成错误结果用于修复${name}。`,
+      },
+    ],
+    timestamp: Date.now(),
+  };
 }
 
 function buildSessionContext(state: SessionState): Message[] {
@@ -533,7 +639,11 @@ async function loadSessionFile(
   return { header, entries };
 }
 
-function buildStateFromEntries(filePath: string, header: SessionHeaderEntry, entries: SessionEntry[]): SessionState {
+function buildStateFromEntries(
+  filePath: string,
+  header: SessionHeaderEntry,
+  entries: SessionEntry[],
+): SessionState {
   const byId = new Map<string, SessionEntry>();
   const messageIdByRef = new WeakMap<Message, string>();
   let leafId: string | null = null;
@@ -559,6 +669,8 @@ function buildStateFromEntries(filePath: string, header: SessionHeaderEntry, ent
     leafId,
     flushed: true,
     hasAssistant,
+    pendingToolUses: new Map<string, string | undefined>(),
+    skipToolGuard: false,
   };
 }
 
@@ -606,12 +718,27 @@ function buildStateFromLegacy(filePath: string, messages: Message[]): SessionSta
     leafId,
     flushed: false,
     hasAssistant,
+    pendingToolUses: new Map<string, string | undefined>(),
+    skipToolGuard: false,
   };
 }
 
-async function rewriteSessionFile(state: SessionState, baseDir: string): Promise<void> {
+async function rewriteSessionFile(
+  state: SessionState,
+  baseDir: string,
+  opts?: { skipLock?: boolean },
+): Promise<void> {
   await fs.mkdir(baseDir, { recursive: true });
   const lines = [state.header, ...state.entries].map((entry) => JSON.stringify(entry));
   const content = `${lines.join("\n")}\n`;
-  await fs.writeFile(state.filePath, content);
+  if (opts?.skipLock) {
+    await fs.writeFile(state.filePath, content);
+    return;
+  }
+  const lock = await acquireSessionWriteLock({ sessionFile: state.filePath });
+  try {
+    await fs.writeFile(state.filePath, content);
+  } finally {
+    await lock.release();
+  }
 }
