@@ -22,12 +22,9 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { exec as execCallback, spawn } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn } from "node:child_process";
 import type { Tool, ToolContext } from "./types.js";
 import { assertSandboxPath } from "../sandbox-paths.js";
-
-const execAsync = promisify(execCallback);
 
 // ============== 文件读取 ==============
 
@@ -219,6 +216,13 @@ export const editTool: Tool<{
  * - cwd 设置为 workspaceDir，命令在工作区内执行
  * - 但这不能完全防止恶意命令，生产环境应该用 Docker 沙箱
  */
+/**
+ * 执行命令工具
+ *
+ * AbortSignal 集成 (对应 OpenClaw: src/agents/bash-tools.exec.ts:1465-1476):
+ * - abort signal 触发时杀掉前台进程
+ * - 超时仍然生效（timeout 和 abort 是独立的）
+ */
 export const execTool: Tool<{ command: string; timeout?: number }> = {
   name: "exec",
   description: "执行 shell 命令",
@@ -231,19 +235,49 @@ export const execTool: Tool<{ command: string; timeout?: number }> = {
     required: ["command"],
   },
   async execute(input, ctx) {
-    const timeout = input.timeout ?? 30000; // 30 秒超时
+    const timeout = input.timeout ?? 30000;
 
     try {
-      const { stdout, stderr } = await execAsync(input.command, {
+      const child = spawn("sh", ["-c", input.command], {
         cwd: ctx.workspaceDir,
-        timeout,
-        maxBuffer: 1024 * 1024, // 1MB，允许命令产生较多输出
+        stdio: ["ignore", "pipe", "pipe"],
       });
+
+      // AbortSignal → 杀进程
+      // 对应 OpenClaw: bash-tools.exec.ts — onAbortSignal → run.kill()
+      const onAbort = () => {
+        try { child.kill(); } catch { /* ignore */ }
+      };
+      if (ctx.abortSignal?.aborted) {
+        onAbort();
+      } else if (ctx.abortSignal) {
+        ctx.abortSignal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      // 超时定时器
+      const timer = setTimeout(() => {
+        try { child.kill(); } catch { /* ignore */ }
+      }, timeout);
+
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+      child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+
+      const exitCode = await new Promise<number | null>((resolve) => {
+        child.on("close", (code) => resolve(code));
+        child.on("error", () => resolve(null));
+      });
+
+      clearTimeout(timer);
+      ctx.abortSignal?.removeEventListener("abort", onAbort);
 
       let result = stdout;
       if (stderr) result += `\n[STDERR]\n${stderr}`;
+      if (exitCode !== null && exitCode !== 0) {
+        result += `\n[EXIT CODE] ${exitCode}`;
+      }
 
-      // 截取前 30KB，防止输出过大占用上下文
       return result.slice(0, 30000);
     } catch (err) {
       return `错误: ${(err as Error).message}`;
@@ -508,6 +542,49 @@ export const memoryGetTool: Tool<{ id: string }> = {
   },
 };
 
+// ============== 记忆写入工具 ==============
+
+/**
+ * 记忆写入工具
+ *
+ * 对应 OpenClaw 设计:
+ * - OpenClaw 没有专用 memory_save 工具，LLM 用 write 工具写入 memory/YYYY-MM-DD.md
+ * - mini 的 memory 系统是 JSON 索引（非文件系统），所以用专用工具替代
+ * - 核心思想一致: LLM 自主决定什么值得记住，而非系统自动保存每轮对话
+ *
+ * 参见 OpenClaw: src/auto-reply/reply/memory-flush.ts
+ * - 仅在 session 接近 compaction 时触发 memory flush turn
+ * - LLM 收到 flush prompt 后自行决定写入哪些 durable facts
+ * - 如果没什么值得保存的，LLM 回复 NO_REPLY
+ */
+export const memorySaveTool: Tool<{
+  content: string;
+  tags?: string[];
+}> = {
+  name: "memory_save",
+  description: "将重要信息写入长期记忆（仅当信息值得长期保存时使用：用户偏好、关键决策、重要待办等）",
+  inputSchema: {
+    type: "object",
+    properties: {
+      content: { type: "string", description: "要保存的内容" },
+      tags: {
+        type: "array",
+        description: "分类标签，便于后续检索",
+      },
+    },
+    required: ["content"],
+  },
+  async execute(input, ctx) {
+    const memory = ctx.memory;
+    if (!memory) {
+      return "记忆系统未启用";
+    }
+    const tags = Array.isArray(input.tags) ? input.tags.filter((t): t is string => typeof t === "string") : [];
+    const id = await memory.add(input.content, "agent", tags);
+    return `已保存到长期记忆: ${id}`;
+  },
+};
+
 // ============== 子代理工具 ==============
 
 /**
@@ -564,7 +641,7 @@ export const sessionsSpawnTool: Tool<{
  * - API 调用
  * - 等等...
  *
- * 但这 9 个是最基础的，理解了这些就理解了工具系统的本质。
+ * 但这 10 个是最基础的，理解了这些就理解了工具系统的本质。
  */
 export const builtinTools: Tool[] = [
   readTool,
@@ -575,5 +652,6 @@ export const builtinTools: Tool[] = [
   grepTool,
   memorySearchTool,
   memoryGetTool,
+  memorySaveTool,
   sessionsSpawnTool,
 ];

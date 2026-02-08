@@ -77,4 +77,5 @@ export {
   execTool,
   listTool,
   grepTool,
+  memorySaveTool,
 } from "./tools/index.js";

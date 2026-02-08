@@ -22,6 +22,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import crypto from "node:crypto";
 import type { Tool, ToolContext } from "./tools/types.js";
 import { builtinTools } from "./tools/builtin.js";
+import { wrapToolWithAbortSignal, abortable } from "./tools/abort.js";
 import { SessionManager, type Message, type ContentBlock } from "./session.js";
 import { MemoryManager, type MemorySearchResult } from "./memory.js";
 import {
@@ -46,7 +47,7 @@ import {
   resolveSessionKey,
   isSubagentSessionKey,
 } from "./session-key.js";
-import { enqueueInLane, resolveGlobalLane, resolveSessionLane } from "./command-queue.js";
+import { enqueueInLane, resolveGlobalLane, resolveSessionLane, setLaneConcurrency } from "./command-queue.js";
 import { filterToolsByPolicy, mergeToolPolicies, type ToolPolicy } from "./tool-policy.js";
 import { emitAgentEvent } from "./agent-events.js";
 
@@ -91,6 +92,14 @@ export interface AgentConfig {
   heartbeatInterval?: number;
   /** 上下文窗口大小（token 估算） */
   contextTokens?: number;
+  /**
+   * Global lane 最大并发数（跨 session 的总并行度）
+   *
+   * 对应 OpenClaw: gateway/server-lanes.ts → resolveAgentMaxConcurrent()
+   * - session lane 固定 maxConcurrent=1（同一 session 内串行）
+   * - global lane 控制不同 session 间可同时跑几个（默认 2）
+   */
+  maxConcurrentRuns?: number;
 }
 
 export interface AgentCallbacks {
@@ -182,6 +191,15 @@ export class Agent {
   private enableSkills: boolean;
   private enableHeartbeat: boolean;
 
+  /**
+   * 运行中的 AbortController 映射 (runId → controller)
+   *
+   * 对应 OpenClaw: pi-embedded-runner/run/attempt.ts
+   * - 每次 run() 创建一个 runAbortController
+   * - abort() 可从外部取消指定或全部运行
+   */
+  private runAbortControllers = new Map<string, AbortController>();
+
   constructor(config: AgentConfig) {
     this.client = new Anthropic({ apiKey: config.apiKey });
     this.model = config.model ?? "claude-sonnet-4-20250514";
@@ -215,6 +233,10 @@ export class Agent {
     this.enableContext = config.enableContext ?? true;
     this.enableSkills = config.enableSkills ?? true;
     this.enableHeartbeat = config.enableHeartbeat ?? false; // 默认关闭自动唤醒
+
+    // Global lane 并发数（对应 OpenClaw resolveAgentMaxConcurrent）
+    const globalLane = resolveGlobalLane();
+    setLaneConcurrency(globalLane, config.maxConcurrentRuns ?? 2);
   }
 
   /**
@@ -264,7 +286,9 @@ export class Agent {
     let tools = [...this.tools];
 
     if (!this.enableMemory) {
-      tools = tools.filter((tool) => tool.name !== "memory_search" && tool.name !== "memory_get");
+      tools = tools.filter(
+        (tool) => tool.name !== "memory_search" && tool.name !== "memory_get" && tool.name !== "memory_save",
+      );
     }
 
     const sandboxPolicy = this.buildSandboxToolPolicy();
@@ -388,9 +412,10 @@ export class Agent {
       }
     }
 
-    // 注入记忆使用指引（工具化）
-    if (this.enableMemory && (availableTools.has("memory_search") || availableTools.has("memory_get"))) {
-      prompt += `\n\n## 记忆\n在回答涉及历史、偏好、决定、待办时：先用 memory_search 查找，再用 memory_get 拉取必要细节。不要臆测。`;
+    // 注入记忆使用指引（工具化，LLM 主导读写）
+    // 对应 OpenClaw: LLM 自行决定何时读取和写入记忆
+    if (this.enableMemory && (availableTools.has("memory_search") || availableTools.has("memory_save"))) {
+      prompt += `\n\n## 记忆\n- 回答涉及历史、偏好、决定时：先用 memory_search 查找，再用 memory_get 拉取细节\n- 遇到值得长期保存的信息（用户偏好、关键决策、重要事实）：用 memory_save 写入\n- 不要保存日常闲聊或一次性查询`;
     }
 
     // 注入沙箱约束说明
@@ -423,6 +448,12 @@ export class Agent {
       enqueueInLane(globalLane, async () => {
         const runId = crypto.randomUUID();
         const startedAt = Date.now();
+
+        // ===== AbortController: 对应 OpenClaw attempt.ts:144 =====
+        // 每次 run 创建独立的 controller，外部可通过 agent.abort(runId) 取消
+        const runAbortController = new AbortController();
+        this.runAbortControllers.set(runId, runAbortController);
+
         emitAgentEvent({
           runId,
           stream: "lifecycle",
@@ -465,6 +496,7 @@ export class Agent {
           sessionId: sessionIdOrKey,
           agentId: resolveAgentIdFromSessionKey(sessionKey),
           memory: this.enableMemory ? this.memory : undefined,
+          abortSignal: runAbortController.signal,
           onMemorySearch: (results) => {
             memoriesUsed += results.length;
             callbacks?.onMemorySearch?.(results);
@@ -516,14 +548,16 @@ export class Agent {
         let totalToolCalls = 0;
         let finalText = "";
         const currentMessages = [...history, userMsg];
+
+        // ===== Compaction: run 开始前做一次 =====
+        // 对应 OpenClaw: compaction 仅在 context overflow 时触发
+        // 参见 src/agents/pi-embedded-runner/run.ts:374 — isContextOverflowError 分支
         const prep = await this.prepareMessagesForRun({
           messages: currentMessages,
           sessionKey,
           runId,
         });
-        let compactionSummary = prep.summaryMessage;
-        let cachedPrune = prep.pruned;
-        let usedInitialPrune = false;
+        const compactionSummary = prep.summaryMessage;
         if (prep.summary) {
           let firstKeptEntryId: string | undefined;
           for (const msg of prep.pruned.messages) {
@@ -548,27 +582,37 @@ export class Agent {
 
         // 构建系统提示
         const systemPrompt = await this.buildSystemPrompt({ sessionKey });
-        const toolsForRun = this.resolveToolsForRun();
+
+        // ===== 工具包装: 注入 run-level abort signal =====
+        // 对应 OpenClaw: pi-tools.ts:426 → wrapToolWithAbortSignal()
+        // 每个工具执行时会合并 tool-level signal 和 run-level signal
+        const rawTools = this.resolveToolsForRun();
+        const toolsForRun = rawTools.map((t) => wrapToolWithAbortSignal(t, runAbortController.signal));
 
         // ===== Agent Loop =====
         while (turns < this.maxTurns) {
           turns++;
           callbacks?.onTurnStart?.(turns);
 
-          const pruneResult = usedInitialPrune
-            ? pruneContextMessages({
-                messages: currentMessages,
-                contextWindowTokens: this.contextTokens,
-              })
-            : cachedPrune;
-          usedInitialPrune = true;
-          cachedPrune = pruneResult;
+          // ===== Prune: 每轮都执行 =====
+          // 对应 OpenClaw: context-pruning extension 在每次 "context" event 时运行
+          // 参见 src/agents/pi-extensions/context-pruning/extension.ts
+          // prune 是纯内存操作（不修改 session 文件），开销可忽略
+          const pruneResult = pruneContextMessages({
+            messages: currentMessages,
+            contextWindowTokens: this.contextTokens,
+          });
           let messagesForModel = pruneResult.messages;
           if (compactionSummary) {
             messagesForModel = [compactionSummary, ...messagesForModel];
           }
 
           // 调用 LLM (流式)
+          // abort 检查: 如果已中止则跳过 LLM 调用
+          if (runAbortController.signal.aborted) {
+            break;
+          }
+
           const stream = this.client.messages.stream({
             model: this.model,
             max_tokens: 4096,
@@ -586,6 +630,7 @@ export class Agent {
 
           // 处理流式响应
           for await (const event of stream) {
+            if (runAbortController.signal.aborted) break;
             if (event.type === "content_block_delta") {
               if (event.delta.type === "text_delta") {
                 callbacks?.onTextDelta?.(event.delta.text);
@@ -603,7 +648,8 @@ export class Agent {
           }
 
           // 获取完整响应
-          const response = await stream.finalMessage();
+          // 对应 OpenClaw: attempt.ts → abortable(activeSession.prompt(...))
+          const response = await abortable(stream.finalMessage(), runAbortController.signal);
 
           // 解析响应
           const assistantContent: ContentBlock[] = [];
@@ -720,14 +766,9 @@ export class Agent {
           currentMessages.push(resultMsg);
         }
 
-        // ===== 保存到记忆 =====
-        if (this.enableMemory && finalText) {
-          await this.memory.add(
-            `Q: ${userMessage}\nA: ${finalText.slice(0, 500)}`,
-            "agent",
-            [sessionKey],
-          );
-        }
+        // 记忆写入: 不再自动保存每轮对话
+        // 对应 OpenClaw 设计: LLM 自行决定何时通过 memory_save 工具写入
+        // 参见 src/auto-reply/reply/memory-flush.ts — 仅在 compaction 前由 LLM 主动 flush
 
         const endedAt = Date.now();
         emitAgentEvent({
@@ -766,9 +807,33 @@ export class Agent {
             },
           });
           throw err;
+        } finally {
+          // 清理 AbortController 引用
+          this.runAbortControllers.delete(runId);
         }
       }),
     );
+  }
+
+  /**
+   * 中止运行
+   *
+   * 对应 OpenClaw: pi-embedded-runner/run/attempt.ts → abortRun()
+   * - 传 runId 取消特定运行
+   * - 不传参数取消所有运行
+   * - signal 级联到所有被包装的工具和 LLM 调用
+   */
+  abort(runId?: string): void {
+    if (runId) {
+      const controller = this.runAbortControllers.get(runId);
+      if (controller) {
+        controller.abort();
+      }
+    } else {
+      for (const controller of this.runAbortControllers.values()) {
+        controller.abort();
+      }
+    }
   }
 
   /**

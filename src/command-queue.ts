@@ -1,21 +1,32 @@
 /**
- * 命令队列（简化版）
+ * 命令队列
  *
- * OpenClaw 使用 lane 级队列保证会话串行、避免并发交错。
- * mini 版本保留“每个 session 一个 lane + 全局 lane”的最小模型。
+ * 对应 OpenClaw: src/process/command-queue.ts
+ *
+ * 两层 lane 设计:
+ * - Session Lane (外层, maxConcurrent=1): 保证同一会话的请求串行，不交错
+ * - Global Lane  (内层, 可配置并发): 控制跨 session 的总并发，防止 API 过载
+ *
+ * 嵌套顺序: enqueueSession(() => enqueueGlobal(() => { ... }))
+ * - Session Lane 保证同一 session 不并发
+ * - Global Lane 控制不同 session 之间的并行度
+ * - 两层协作: session A 和 B 各自串行, 但可同时运行（取决于 global 并发数）
  */
 
 type QueueEntry<T> = {
   task: () => Promise<T>;
   resolve: (value: T) => void;
   reject: (reason?: unknown) => void;
+  enqueuedAt: number;
+  onWait?: (waitMs: number, queuedAhead: number) => void;
+  warnAfterMs: number;
 };
 
 type LaneState = {
+  lane: string;
   active: number;
   queue: Array<QueueEntry<unknown>>;
   maxConcurrent: number;
-  draining: boolean;
 };
 
 const lanes = new Map<string, LaneState>();
@@ -26,10 +37,10 @@ function getLaneState(lane: string): LaneState {
     return existing;
   }
   const created: LaneState = {
+    lane,
     active: 0,
     queue: [],
     maxConcurrent: 1,
-    draining: false,
   };
   lanes.set(lane, created);
   return created;
@@ -37,32 +48,29 @@ function getLaneState(lane: string): LaneState {
 
 function drainLane(lane: string) {
   const state = getLaneState(lane);
-  if (state.draining) {
-    return;
-  }
-  state.draining = true;
 
-  const pump = () => {
-    while (state.active < state.maxConcurrent && state.queue.length > 0) {
-      const entry = state.queue.shift() as QueueEntry<unknown>;
-      state.active += 1;
-      void (async () => {
-        try {
-          const result = await entry.task();
-          state.active -= 1;
-          pump();
-          entry.resolve(result);
-        } catch (err) {
-          state.active -= 1;
-          pump();
-          entry.reject(err);
-        }
-      })();
+  while (state.active < state.maxConcurrent && state.queue.length > 0) {
+    const entry = state.queue.shift() as QueueEntry<unknown>;
+    state.active += 1;
+
+    const waitMs = Date.now() - entry.enqueuedAt;
+    if (waitMs > entry.warnAfterMs && entry.onWait) {
+      entry.onWait(waitMs, state.queue.length);
     }
-    state.draining = false;
-  };
 
-  pump();
+    void (async () => {
+      try {
+        const result = await entry.task();
+        state.active -= 1;
+        drainLane(lane);
+        entry.resolve(result);
+      } catch (err) {
+        state.active -= 1;
+        drainLane(lane);
+        entry.reject(err);
+      }
+    })();
+  }
 }
 
 export function setLaneConcurrency(lane: string, maxConcurrent: number) {
@@ -71,13 +79,25 @@ export function setLaneConcurrency(lane: string, maxConcurrent: number) {
   drainLane(lane);
 }
 
-export function enqueueInLane<T>(lane: string, task: () => Promise<T>): Promise<T> {
+export interface EnqueueOpts {
+  warnAfterMs?: number;
+  onWait?: (waitMs: number, queuedAhead: number) => void;
+}
+
+export function enqueueInLane<T>(
+  lane: string,
+  task: () => Promise<T>,
+  opts?: EnqueueOpts,
+): Promise<T> {
   const state = getLaneState(lane);
   return new Promise<T>((resolve, reject) => {
     state.queue.push({
-      task,
+      task: () => task(),
       resolve: (value) => resolve(value as T),
       reject,
+      enqueuedAt: Date.now(),
+      warnAfterMs: opts?.warnAfterMs ?? 2_000,
+      onWait: opts?.onWait,
     });
     drainLane(lane);
   });
@@ -90,5 +110,5 @@ export function resolveSessionLane(sessionKey: string): string {
 
 export function resolveGlobalLane(lane?: string): string {
   const cleaned = lane?.trim();
-  return cleaned ? cleaned : "global";
+  return cleaned ? cleaned : "main";
 }
