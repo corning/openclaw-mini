@@ -13,7 +13,26 @@ import {
 export const BASE_CHUNK_RATIO = 0.4;
 export const MIN_CHUNK_RATIO = 0.15;
 export const SAFETY_MARGIN = 1.2;
-export const DEFAULT_COMPACTION_TRIGGER_RATIO = 0.75;
+
+/**
+ * Compaction 设置
+ *
+ * 对应 OpenClaw:
+ * - pi-settings.ts → DEFAULT_PI_COMPACTION_RESERVE_TOKENS_FLOOR = 20_000
+ * - config/types.agent-defaults.ts → AgentCompactionConfig
+ */
+export interface CompactionSettings {
+  enabled: boolean;
+  reserveTokens: number;
+  keepRecentTokens: number;
+}
+
+export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
+  enabled: true,
+  reserveTokens: 20_000,
+  keepRecentTokens: 20_000,
+};
+
 export const DEFAULT_SUMMARY_MAX_TOKENS = 900;
 const DEFAULT_SUMMARY_FALLBACK = "No prior history.";
 const DEFAULT_PARTS = 2;
@@ -491,24 +510,39 @@ export async function summarizeInStages(params: {
   });
 }
 
+/**
+ * 是否应该触发 compaction
+ *
+ * 对应 OpenClaw: pi-coding-agent → shouldCompact(contextTokens, contextWindow, settings)
+ * 触发条件: contextTokens > contextWindow - reserveTokens
+ * （reserve-based，不是 ratio-based）
+ */
 export function shouldTriggerCompaction(params: {
   messages: Message[];
   contextWindowTokens: number;
-  triggerRatio?: number;
+  settings?: Partial<CompactionSettings>;
 }): boolean {
-  const triggerRatio =
-    typeof params.triggerRatio === "number" && Number.isFinite(params.triggerRatio)
-      ? Math.min(1, Math.max(0, params.triggerRatio))
-      : DEFAULT_COMPACTION_TRIGGER_RATIO;
+  const settings = {
+    ...DEFAULT_COMPACTION_SETTINGS,
+    ...params.settings,
+  };
+  if (!settings.enabled) return false;
   const totalTokens = estimateMessagesTokens(params.messages);
-  return totalTokens > Math.floor(params.contextWindowTokens * triggerRatio);
+  return totalTokens > params.contextWindowTokens - settings.reserveTokens;
 }
 
+/**
+ * 生成 compaction 摘要
+ *
+ * 对应 OpenClaw: pi-coding-agent → generateSummary()
+ * maxTokens = floor(0.8 × reserveTokens)
+ */
 export async function buildCompactionSummary(params: {
   summarize: SummarizeFn;
   messages: Message[];
   contextWindowTokens: number;
   maxTokens?: number;
+  reserveTokens?: number;
   customInstructions?: string;
 }): Promise<string> {
   if (params.messages.length === 0) {
@@ -516,7 +550,9 @@ export async function buildCompactionSummary(params: {
   }
   const adaptiveRatio = computeAdaptiveChunkRatio(params.messages, params.contextWindowTokens);
   const maxChunkTokens = Math.max(1, Math.floor(params.contextWindowTokens * adaptiveRatio));
-  const maxTokens = Math.max(64, Math.floor(params.maxTokens ?? DEFAULT_SUMMARY_MAX_TOKENS));
+  // 对应 OpenClaw: maxTokens = Math.floor(0.8 * reserveTokens)
+  const reserveTokens = params.reserveTokens ?? DEFAULT_COMPACTION_SETTINGS.reserveTokens;
+  const maxTokens = Math.max(64, Math.floor(params.maxTokens ?? (0.8 * reserveTokens)));
 
   return summarizeInStages({
     messages: params.messages,
@@ -533,7 +569,7 @@ export async function compactHistoryIfNeeded(params: {
   messages: Message[];
   contextWindowTokens: number;
   pruningSettings?: Partial<ContextPruningSettings>;
-  triggerRatio?: number;
+  compactionSettings?: Partial<CompactionSettings>;
   maxTokens?: number;
 }): Promise<{
   summary?: string;
@@ -549,18 +585,20 @@ export async function compactHistoryIfNeeded(params: {
   const shouldCompact = shouldTriggerCompaction({
     messages: params.messages,
     contextWindowTokens: params.contextWindowTokens,
-    triggerRatio: params.triggerRatio,
+    settings: params.compactionSettings,
   });
 
   if (!shouldCompact || pruneResult.droppedMessages.length === 0) {
     return { pruneResult };
   }
 
+  const resolvedSettings = { ...DEFAULT_COMPACTION_SETTINGS, ...params.compactionSettings };
   let summary = await buildCompactionSummary({
     summarize: params.summarize,
     messages: pruneResult.droppedMessages,
     contextWindowTokens: params.contextWindowTokens,
     maxTokens: params.maxTokens,
+    reserveTokens: resolvedSettings.reserveTokens,
   });
   const fileOps = createFileOps();
   for (const message of pruneResult.droppedMessages) {

@@ -29,8 +29,19 @@ type CompiledPattern =
   | { kind: "exact"; value: string }
   | { kind: "regex"; value: RegExp };
 
+/**
+ * 工具名归一化
+ *
+ * 对应 OpenClaw: normalizeToolName()
+ * - apply-patch → apply_patch
+ * - bash → exec
+ */
 function normalizeToolName(name: string): string {
-  return name.trim().toLowerCase();
+  const trimmed = name.trim().toLowerCase();
+  // 对齐 openclaw 别名映射
+  if (trimmed === "apply-patch") return "apply_patch";
+  if (trimmed === "bash") return "exec";
+  return trimmed;
 }
 
 /**
@@ -86,7 +97,8 @@ function matchesAny(name: string, patterns: CompiledPattern[]): boolean {
  * 1. deny 优先 — 匹配 deny 则拒绝
  * 2. allow 为空 — 允许一切
  * 3. allow 匹配 — 明确允许
- * 4. 默认拒绝
+ * 4. apply_patch 继承 exec 权限（openclaw 特殊规则）
+ * 5. 默认拒绝
  */
 export function isToolAllowed(name: string, policy?: ToolPolicy): boolean {
   if (!policy) return true;
@@ -97,7 +109,10 @@ export function isToolAllowed(name: string, policy?: ToolPolicy): boolean {
 
   if (matchesAny(normalized, deny)) return false;
   if (allow.length === 0) return true;
-  return matchesAny(normalized, allow);
+  if (matchesAny(normalized, allow)) return true;
+  // 对应 OpenClaw: apply_patch 继承 exec 的权限
+  if (normalized === "apply_patch" && matchesAny("exec", allow)) return true;
+  return false;
 }
 
 export function filterToolsByPolicy(tools: Tool[], policy?: ToolPolicy): Tool[] {
@@ -109,22 +124,10 @@ export function filterToolsByPolicy(tools: Tool[], policy?: ToolPolicy): Tool[] 
     const normalized = normalizeToolName(tool.name);
     if (matchesAny(normalized, deny)) return false;
     if (allow.length === 0) return true;
-    return matchesAny(normalized, allow);
+    if (matchesAny(normalized, allow)) return true;
+    // 对应 OpenClaw: apply_patch 继承 exec 权限
+    if (normalized === "apply_patch" && matchesAny("exec", allow)) return true;
+    return false;
   });
 }
 
-export function mergeToolPolicies(base?: ToolPolicy, extra?: ToolPolicy): ToolPolicy | undefined {
-  if (!base && !extra) return undefined;
-  const allow = [
-    ...(base?.allow ?? []),
-    ...(extra?.allow ?? []),
-  ].map((v) => v.trim()).filter(Boolean);
-  const deny = [
-    ...(base?.deny ?? []),
-    ...(extra?.deny ?? []),
-  ].map((v) => v.trim()).filter(Boolean);
-  return {
-    allow: allow.length > 0 ? Array.from(new Set(allow)) : undefined,
-    deny: deny.length > 0 ? Array.from(new Set(deny)) : undefined,
-  };
-}

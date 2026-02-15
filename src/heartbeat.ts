@@ -1,24 +1,27 @@
 /**
  * 主动唤醒机制 (Heartbeat)
  *
- * 基于 OpenClaw 源码的真实实现:
+ * 对应 OpenClaw 源码:
+ * - src/infra/heartbeat-wake.ts — 事件驱动唤醒 + 请求合并 (coalesce)
+ * - src/infra/heartbeat-runner.ts — 定时调度 + HEARTBEAT.md 上下文传递
  *
- * 1. Heartbeat Runner (heartbeat-runner.ts)
- *    - setTimeout 精确调度 (非 setInterval)
- *    - 活跃时间窗口 (activeHours)
- *    - HEARTBEAT.md 空内容检测
- *    - 重复消息抑制 (24h)
+ * 核心设计理念 (对齐 openclaw):
+ * HEARTBEAT.md 不是任务列表——不做 checkbox 解析、不做结构化任务管理。
+ * 它是 LLM 的上下文输入: HeartbeatManager 读取内容原样传递给回调
+ * (对应 openclaw 的 getReplyFromConfig)，由 LLM 自行决定如何响应。
  *
- * 2. Heartbeat Wake (heartbeat-wake.ts)
- *    - 事件驱动唤醒
- *    - 请求合并 (coalesce 250ms)
- *    - 双重缓冲 (运行中排队)
+ * 分层:
+ * 1. HeartbeatWake — 请求合并层
+ *    - 多个请求在 coalesceMs 内合并为一次执行
+ *    - 双重缓冲: 运行中的新请求排队，运行结束后立即再执行
+ *    - requests-in-flight 跳过时自动重试 (1s 延迟)
  *
- * 3. 多来源触发:
- *    - interval: 定时器到期
- *    - cron: 定时任务完成
- *    - exec: 命令执行完成
- *    - requested: 手动请求
+ * 2. HeartbeatManager — 调度 + 策略层
+ *    - setTimeout 精确调度 (非 setInterval，对齐 openclaw)
+ *    - 活跃时间窗口 (activeHours)，支持跨午夜
+ *    - HEARTBEAT.md 空内容检测 (去除 frontmatter/注释后判断)
+ *    - exec 事件豁免空内容跳过 (命令完成通知总是传递)
+ *    - 重复消息抑制 (24h 窗口 + 文本比较)
  */
 
 import fs from "node:fs/promises";
@@ -26,23 +29,26 @@ import path from "node:path";
 
 // ============== 类型定义 ==============
 
-export interface HeartbeatTask {
-  description: string;
-  completed: boolean;
-  raw: string;
-  line: number;
-}
-
+/**
+ * 活跃时间窗口
+ *
+ * 对应 OpenClaw heartbeat-runner.ts: isWithinActiveHours()
+ * - 控制 heartbeat 仅在指定时间段内运行
+ * - 支持跨午夜 (如 start=22:00, end=06:00)
+ */
 export interface ActiveHours {
-  start: string; // "HH:MM" 格式
+  /** 开始时间 "HH:MM" 格式 */
+  start: string;
+  /** 结束时间 "HH:MM" 格式 */
   end: string;
-  timezone?: string; // 默认本地时区
+  /** 时区标识，默认本地时区 */
+  timezone?: string;
 }
 
 export interface HeartbeatConfig {
   /** 检查间隔 (毫秒)，默认 30 分钟 */
   intervalMs?: number;
-  /** HEARTBEAT.md 路径 */
+  /** HEARTBEAT.md 路径（相对于 workspaceDir 或绝对路径） */
   heartbeatPath?: string;
   /** 活跃时间窗口 */
   activeHours?: ActiveHours;
@@ -54,176 +60,222 @@ export interface HeartbeatConfig {
   duplicateWindowMs?: number;
 }
 
+/**
+ * 唤醒原因
+ *
+ * 对应 OpenClaw heartbeat-runner.ts 中的多种触发来源:
+ * - interval: 定时器到期 (scheduleNext)
+ * - exec: 异步命令执行完成 (EXEC_EVENT_PROMPT，豁免空内容跳过)
+ * - requested: 外部手动请求
+ * - retry: 上次因 requests-in-flight 跳过后的自动重试
+ */
 export type WakeReason =
-  | "interval"      // 定时器到期
-  | "cron"          // Cron 任务完成
-  | "exec"          // 命令执行完成
-  | "requested"     // 手动请求
-  | "retry";        // 重试
+  | "interval"
+  | "exec"
+  | "requested"
+  | "retry";
 
 export interface WakeRequest {
   reason: WakeReason;
-  source?: string; // 来源标识，如 "cron:job-123"
-}
-
-export interface HeartbeatResult {
-  status: "ok" | "skipped" | "error";
-  reason?: string;
-  tasks?: HeartbeatTask[];
-  text?: string;
-}
-
-export type HeartbeatHandler = (
-  tasks: HeartbeatTask[],
-  request: WakeRequest,
-) => Promise<HeartbeatResult>;
-
-// ============== Heartbeat Wake (请求合并层) ==============
-
-interface WakeState {
-  running: boolean;
-  scheduled: boolean;
-  timer: ReturnType<typeof setTimeout> | null;
-  pendingReason: WakeReason;
-  pendingSource?: string;
+  source?: string;
 }
 
 /**
- * Heartbeat Wake - 请求合并和双重缓冲
+ * Heartbeat 运行结果
+ *
+ * 对应 OpenClaw: HeartbeatRunResult
+ * - ran: 成功执行并产生了输出
+ * - skipped: 因某种原因跳过 (活跃时间/空内容/重复)
+ * - failed: 执行出错
+ */
+export interface HeartbeatResult {
+  status: "ran" | "skipped" | "failed";
+  durationMs?: number;
+  reason?: string;
+}
+
+/**
+ * Heartbeat 回调
+ *
+ * 对应 OpenClaw heartbeat-runner.ts 中 getReplyFromConfig() 的角色:
+ * 接收 HEARTBEAT.md 原始内容作为上下文，由调用方（通常是 LLM）
+ * 生成回复文本。
+ *
+ * 返回值:
+ * - { text: "..." }: 有内容要发送（会经过重复抑制检查）
+ * - { text: undefined } 或 null: 等同于 openclaw 的 HEARTBEAT_OK
+ *   (LLM 判定当前没有需要主动通知的内容)
+ */
+export type HeartbeatCallback = (opts: {
+  /** HEARTBEAT.md 文件内容（原样传递，不做解析） */
+  content: string;
+  /** 唤醒原因 */
+  reason: WakeReason;
+  /** 来源标识 */
+  source?: string;
+}) => Promise<{ text?: string } | null>;
+
+/**
+ * Heartbeat 内部处理器
+ *
+ * 对应 OpenClaw: HeartbeatWakeHandler
+ * HeartbeatWake 层调用此处理器执行一次 heartbeat
+ */
+export type HeartbeatHandler = (opts: {
+  reason?: string;
+}) => Promise<HeartbeatResult>;
+
+// ============== HeartbeatWake (请求合并层) ==============
+
+/**
+ * 对应 OpenClaw: src/infra/heartbeat-wake.ts
  *
  * 核心机制:
  * 1. 多个请求在 coalesceMs 内合并为一次执行
- * 2. 如果正在运行，新请求排队等待
- * 3. 运行完成后，如果有排队请求，立即再次运行
+ * 2. 如果正在运行，新请求排队等待 (scheduled flag)
+ * 3. 运行完成后，如果有排队请求，继续调度
+ * 4. requests-in-flight 跳过时自动重试 (retryMs)
+ *
+ * 与 openclaw heartbeat-wake.ts 的结构一一对应:
+ * - handler / pendingReason / scheduled / running / timer 五个全局变量
+ * - schedule() / setHandler() / requestNow()
  */
 class HeartbeatWake {
-  private state: WakeState = {
-    running: false,
-    scheduled: false,
-    timer: null,
-    pendingReason: "requested",
-  };
-
   private handler: HeartbeatHandler | null = null;
-  private coalesceMs: number;
-  private retryMs = 1000;
+  private pendingReason: string | null = null;
+  private scheduled = false;
+  private running = false;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+
+  private readonly coalesceMs: number;
+  private readonly retryMs = 1_000;
 
   constructor(coalesceMs = 250) {
     this.coalesceMs = coalesceMs;
   }
 
-  setHandler(handler: HeartbeatHandler): void {
+  setHandler(handler: HeartbeatHandler | null): void {
     this.handler = handler;
+    if (handler && this.pendingReason) {
+      this.schedule(this.coalesceMs);
+    }
   }
 
   /**
-   * 请求立即唤醒
-   * 多个请求会合并，原因优先级: exec > cron > interval > requested
+   * 请求唤醒
+   *
+   * 对应 openclaw: requestHeartbeatNow()
    */
-  request(req: WakeRequest): void {
-    // 原因优先级合并
-    this.state.pendingReason = this.mergeReason(
-      this.state.pendingReason,
-      req.reason,
-    );
-    if (req.source) {
-      this.state.pendingSource = req.source;
-    }
-
-    this.schedule(this.coalesceMs);
-  }
-
-  private mergeReason(current: WakeReason, incoming: WakeReason): WakeReason {
-    const priority: Record<WakeReason, number> = {
-      exec: 4,
-      cron: 3,
-      interval: 2,
-      retry: 1,
-      requested: 0,
-    };
-    return priority[incoming] > priority[current] ? incoming : current;
+  request(reason: string = "requested", coalesceMs?: number): void {
+    this.pendingReason = reason;
+    this.schedule(coalesceMs ?? this.coalesceMs);
   }
 
   private schedule(delayMs: number): void {
-    // 如果已在运行，标记为已排队
-    if (this.state.running) {
-      this.state.scheduled = true;
+    // 对齐 openclaw: 如果 timer 已存在，不重复创建（请求合并）
+    if (this.timer) {
       return;
     }
 
-    // 如果已有定时器，不重复设置（合并）
-    if (this.state.timer) {
-      return;
-    }
+    this.timer = setTimeout(async () => {
+      this.timer = null;
+      this.scheduled = false;
 
-    this.state.timer = setTimeout(() => this.execute(), delayMs);
-  }
+      const active = this.handler;
+      if (!active) return;
 
-  private async execute(): Promise<void> {
-    this.state.timer = null;
-    this.state.running = true;
-
-    const request: WakeRequest = {
-      reason: this.state.pendingReason,
-      source: this.state.pendingSource,
-    };
-
-    // 重置 pending 状态
-    this.state.pendingReason = "requested";
-    this.state.pendingSource = undefined;
-    this.state.scheduled = false;
-
-    try {
-      if (!this.handler) {
+      // 对齐 openclaw: 如果正在运行，标记为 scheduled 并重新调度
+      if (this.running) {
+        this.scheduled = true;
+        this.schedule(this.coalesceMs);
         return;
       }
 
-      const result = await this.handler([], request);
+      const reason = this.pendingReason;
+      this.pendingReason = null;
+      this.running = true;
 
-      // 如果跳过且原因是队列繁忙，重试
-      if (result.status === "skipped" && result.reason === "requests-in-flight") {
-        this.state.pendingReason = "retry";
+      try {
+        const res = await active({ reason: reason ?? undefined });
+
+        // 对齐 openclaw: requests-in-flight 时自动重试
+        if (res.status === "skipped" && res.reason === "requests-in-flight") {
+          this.pendingReason = reason ?? "retry";
+          this.schedule(this.retryMs);
+        }
+      } catch {
+        // 对齐 openclaw: 错误时也自动重试
+        this.pendingReason = reason ?? "retry";
         this.schedule(this.retryMs);
+      } finally {
+        this.running = false;
+        if (this.pendingReason || this.scheduled) {
+          this.schedule(this.coalesceMs);
+        }
       }
-    } finally {
-      this.state.running = false;
+    }, delayMs);
+  }
 
-      // 如果运行期间有新请求排队，立即再次执行
-      if (this.state.scheduled) {
-        this.state.scheduled = false;
-        this.schedule(0);
-      }
-    }
+  hasPending(): boolean {
+    return this.pendingReason !== null || Boolean(this.timer) || this.scheduled;
   }
 
   stop(): void {
-    if (this.state.timer) {
-      clearTimeout(this.state.timer);
-      this.state.timer = null;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
     }
-    this.state.scheduled = false;
+    this.scheduled = false;
+    this.pendingReason = null;
   }
 }
 
-// ============== Heartbeat Runner (调度层) ==============
+// ============== 辅助函数 ==============
 
+/**
+ * HEARTBEAT.md 空内容检测
+ *
+ * 对应 OpenClaw heartbeat-runner.ts: isHeartbeatContentEffectivelyEmpty()
+ * 去除 frontmatter 和 HTML 注释后，判断是否只剩空白
+ */
+function isContentEffectivelyEmpty(content: string): boolean {
+  // 去除 YAML frontmatter
+  const noFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\s*/, "");
+  // 去除 HTML 注释
+  const noComments = noFrontmatter.replace(/<!--[\s\S]*?-->/g, "");
+  return noComments.trim().length === 0;
+}
+
+// ============== HeartbeatManager (调度 + 策略层) ==============
+
+/**
+ * 调度器内部状态
+ *
+ * 对应 OpenClaw heartbeat-runner.ts: HeartbeatAgentState
+ */
 interface RunnerState {
+  /** 下一次到期时间戳 (ms) */
   nextDueMs: number;
+  /** 调度定时器 */
   timer: ReturnType<typeof setTimeout> | null;
-  lastRunAt: number | null;
+  /** 上次运行时间戳 */
+  lastRunMs: number | null;
+  /** 上次发送的文本 (用于重复抑制) */
   lastText: string | null;
+  /** 上次发送文本的时间戳 */
   lastTextAt: number | null;
 }
 
 /**
  * Heartbeat Manager - 主动唤醒管理器
  *
- * 核心职责:
- * 1. 定时调度 (setTimeout 精确调度)
- * 2. 活跃时间窗口检查
- * 3. HEARTBEAT.md 解析和空内容检测
- * 4. 重复消息抑制
- * 5. 事件驱动唤醒 (通过 HeartbeatWake)
+ * 对应 OpenClaw heartbeat-runner.ts 中 startHeartbeatRunner() 的角色:
+ * - setTimeout 精确调度（非 setInterval，openclaw 的做法）
+ * - 活跃时间窗口检查
+ * - HEARTBEAT.md 空内容检测（非任务解析——这是与 openclaw 对齐的关键）
+ * - 重复消息抑制 (24h)
+ * - exec 事件豁免空内容跳过
+ * - 通过 HeartbeatWake 支持事件驱动唤醒
  */
 export class HeartbeatManager {
   private workspaceDir: string;
@@ -234,19 +286,19 @@ export class HeartbeatManager {
   private state: RunnerState = {
     nextDueMs: 0,
     timer: null,
-    lastRunAt: null,
+    lastRunMs: null,
     lastText: null,
     lastTextAt: null,
   };
 
   private wake: HeartbeatWake;
-  private callbacks: HeartbeatHandler[] = [];
+  private callback: HeartbeatCallback | null = null;
   private started = false;
 
   constructor(workspaceDir: string, config: HeartbeatConfig = {}) {
     this.workspaceDir = workspaceDir;
     this.config = {
-      intervalMs: config.intervalMs ?? 30 * 60 * 1000, // 30 分钟
+      intervalMs: config.intervalMs ?? 30 * 60 * 1000,
       heartbeatPath: config.heartbeatPath ?? "HEARTBEAT.md",
       enabled: config.enabled ?? true,
       coalesceMs: config.coalesceMs ?? 250,
@@ -255,29 +307,39 @@ export class HeartbeatManager {
     };
 
     this.wake = new HeartbeatWake(this.config.coalesceMs);
-    this.wake.setHandler((_, request) => this.runOnce(request));
+    // HeartbeatWake 的 handler 对应 openclaw 的 runHeartbeatOnce
+    this.wake.setHandler((opts) => this.runOnce(opts.reason));
   }
 
   // ============== 公共 API ==============
 
   /**
-   * 启动 Heartbeat 监控
+   * 注册回调
+   *
+   * 对应 OpenClaw 中 heartbeat-runner 内部调用 getReplyFromConfig():
+   * 回调接收 HEARTBEAT.md 原始内容，由调用方决定如何响应
+   */
+  onHeartbeat(callback: HeartbeatCallback): void {
+    this.callback = callback;
+  }
+
+  /**
+   * 启动 Heartbeat 调度
+   *
+   * 对应 OpenClaw: startHeartbeatRunner()
    */
   start(): void {
     if (!this.config.enabled || this.started) return;
     this.started = true;
-
-    // 计算下一次运行时间
     this.scheduleNext();
   }
 
   /**
-   * 停止 Heartbeat 监控
+   * 停止 Heartbeat 调度
    */
   stop(): void {
     this.started = false;
     this.wake.stop();
-
     if (this.state.timer) {
       clearTimeout(this.state.timer);
       this.state.timer = null;
@@ -285,289 +347,33 @@ export class HeartbeatManager {
   }
 
   /**
-   * 注册回调
-   */
-  onTasks(callback: HeartbeatHandler): void {
-    this.callbacks.push(callback);
-  }
-
-  /**
    * 请求立即唤醒 (事件驱动)
+   *
+   * 对应 OpenClaw: requestHeartbeatNow()
    */
-  requestNow(reason: WakeReason = "requested", source?: string): void {
-    this.wake.request({ reason, source });
+  requestNow(reason: WakeReason = "requested"): void {
+    this.wake.request(reason);
   }
 
   /**
-   * 手动触发检查 (同步等待)
+   * 手动触发一次 (同步等待结果)
    */
-  async trigger(): Promise<HeartbeatTask[]> {
-    const result = await this.runOnce({ reason: "requested" });
-    return result.tasks ?? [];
-  }
-
-  // ============== 调度逻辑 ==============
-
-  /**
-   * 调度下一次运行 (setTimeout 精确调度)
-   */
-  private scheduleNext(): void {
-    if (!this.started) return;
-
-    const now = Date.now();
-    const lastRun = this.state.lastRunAt ?? now;
-    const nextDue = lastRun + this.config.intervalMs;
-
-    this.state.nextDueMs = nextDue;
-
-    const delay = Math.max(0, nextDue - now);
-
-    this.state.timer = setTimeout(() => {
-      this.wake.request({ reason: "interval" });
-    }, delay);
+  async trigger(): Promise<HeartbeatResult> {
+    return this.runOnce("requested");
   }
 
   /**
-   * 执行一次 Heartbeat 检查
+   * 读取 HEARTBEAT.md 内容
+   *
+   * 公开给外部使用（如 agent 构建系统提示时可选引用）
    */
-  private async runOnce(request: WakeRequest): Promise<HeartbeatResult> {
-    const now = Date.now();
-
-    // 1. 活跃时间窗口检查
-    if (!this.isWithinActiveHours(now)) {
-      return { status: "skipped", reason: "outside-active-hours" };
-    }
-
-    // 2. 解析 HEARTBEAT.md
-    const tasks = await this.parseTasks();
-    const pending = tasks.filter((t) => !t.completed);
-
-    // 3. 空内容检测 (exec 事件除外)
-    if (pending.length === 0 && request.reason !== "exec") {
-      this.state.lastRunAt = now;
-      this.scheduleNext();
-      return { status: "skipped", reason: "no-pending-tasks" };
-    }
-
-    // 4. 执行回调
-    let resultText: string | undefined;
-    for (const callback of this.callbacks) {
-      try {
-        const result = await callback(pending, request);
-        if (result.text) {
-          resultText = result.text;
-        }
-      } catch (err) {
-        console.error("[Heartbeat] Callback error:", err);
-      }
-    }
-
-    // 5. 重复消息抑制
-    if (resultText && this.isDuplicateMessage(resultText, now)) {
-      this.state.lastRunAt = now;
-      this.scheduleNext();
-      return { status: "skipped", reason: "duplicate-message", tasks: pending };
-    }
-
-    // 6. 更新状态
-    this.state.lastRunAt = now;
-    if (resultText) {
-      this.state.lastText = resultText;
-      this.state.lastTextAt = now;
-    }
-
-    // 7. 调度下一次
-    this.scheduleNext();
-
-    return { status: "ok", tasks: pending, text: resultText };
-  }
-
-  // ============== 辅助方法 ==============
-
-  /**
-   * 检查是否在活跃时间窗口内
-   */
-  private isWithinActiveHours(nowMs: number): boolean {
-    const { activeHours } = this.config;
-    if (!activeHours) return true;
-
-    const date = new Date(nowMs);
-    const currentMinutes = date.getHours() * 60 + date.getMinutes();
-
-    const [startH, startM] = activeHours.start.split(":").map(Number);
-    const [endH, endM] = activeHours.end.split(":").map(Number);
-
-    const startMinutes = startH * 60 + startM;
-    const endMinutes = endH * 60 + endM;
-
-    // 处理跨午夜的情况
-    if (endMinutes <= startMinutes) {
-      // 例如 22:00 - 06:00
-      return currentMinutes >= startMinutes || currentMinutes < endMinutes;
-    }
-
-    return currentMinutes >= startMinutes && currentMinutes < endMinutes;
-  }
-
-  /**
-   * 检查是否是重复消息 (24h 内)
-   */
-  private isDuplicateMessage(text: string, nowMs: number): boolean {
-    if (!this.state.lastText || !this.state.lastTextAt) {
-      return false;
-    }
-
-    const timeSinceLast = nowMs - this.state.lastTextAt;
-    if (timeSinceLast >= this.config.duplicateWindowMs) {
-      return false;
-    }
-
-    return text.trim() === this.state.lastText.trim();
-  }
-
-  /**
-   * 获取 HEARTBEAT.md 路径
-   */
-  private getHeartbeatPath(): string {
-    if (path.isAbsolute(this.config.heartbeatPath)) {
-      return this.config.heartbeatPath;
-    }
-    return path.join(this.workspaceDir, this.config.heartbeatPath);
-  }
-
-  /**
-   * 解析 HEARTBEAT.md 任务
-   */
-  async parseTasks(): Promise<HeartbeatTask[]> {
+  async readContent(): Promise<string | null> {
     const filePath = this.getHeartbeatPath();
     try {
-      const content = await fs.readFile(filePath, "utf-8");
-      return this.parseTasksFromContent(content);
+      return await fs.readFile(filePath, "utf-8");
     } catch {
-      return [];
+      return null;
     }
-  }
-
-  /**
-   * 从内容解析任务
-   */
-  private parseTasksFromContent(content: string): HeartbeatTask[] {
-    const lines = content.split("\n");
-    const tasks: HeartbeatTask[] = [];
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const trimmed = line.trim();
-
-      // 跳过空行和标题
-      if (!trimmed || /^#+\s/.test(trimmed)) continue;
-
-      // checkbox 格式: - [ ] 或 - [x]
-      const checkboxMatch = trimmed.match(/^[-*+]\s*\[([\sXx]?)\]\s*(.+)$/);
-      if (checkboxMatch) {
-        const [, check, description] = checkboxMatch;
-        tasks.push({
-          description: description.trim(),
-          completed: check.toLowerCase() === "x",
-          raw: line,
-          line: i + 1,
-        });
-        continue;
-      }
-
-      // 普通列表格式: - item
-      const listMatch = trimmed.match(/^[-*+]\s+(.+)$/);
-      if (listMatch) {
-        const [, description] = listMatch;
-        if (!/^\s*$/.test(description)) {
-          tasks.push({
-            description: description.trim(),
-            completed: false,
-            raw: line,
-            line: i + 1,
-          });
-        }
-      }
-    }
-
-    return tasks;
-  }
-
-  /**
-   * 获取未完成任务
-   */
-  async getPendingTasks(): Promise<HeartbeatTask[]> {
-    const tasks = await this.parseTasks();
-    return tasks.filter((t) => !t.completed);
-  }
-
-  /**
-   * 检查是否有待办任务
-   */
-  async hasPendingTasks(): Promise<boolean> {
-    const pending = await this.getPendingTasks();
-    return pending.length > 0;
-  }
-
-  /**
-   * 标记任务完成
-   */
-  async markCompleted(lineNumber: number): Promise<boolean> {
-    const filePath = this.getHeartbeatPath();
-    try {
-      const content = await fs.readFile(filePath, "utf-8");
-      const lines = content.split("\n");
-
-      if (lineNumber < 1 || lineNumber > lines.length) {
-        return false;
-      }
-
-      const line = lines[lineNumber - 1];
-      const updated = line.replace(/\[\s?\]/, "[x]");
-
-      if (updated === line) {
-        return false;
-      }
-
-      lines[lineNumber - 1] = updated;
-      await fs.writeFile(filePath, lines.join("\n"));
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * 添加任务
-   */
-  async addTask(description: string): Promise<void> {
-    const filePath = this.getHeartbeatPath();
-    try {
-      let content = "";
-      try {
-        content = await fs.readFile(filePath, "utf-8");
-      } catch {
-        content = "# Heartbeat Tasks\n\n";
-      }
-
-      const task = `- [ ] ${description}\n`;
-      content = content.trimEnd() + "\n" + task;
-
-      await fs.writeFile(filePath, content);
-    } catch (err) {
-      throw new Error(`Failed to add task: ${(err as Error).message}`);
-    }
-  }
-
-  /**
-   * 构建任务提示
-   */
-  async buildTasksPrompt(): Promise<string> {
-    const pending = await this.getPendingTasks();
-    if (pending.length === 0) return "";
-
-    const lines = pending.map((t, i) => `${i + 1}. ${t.description}`);
-    return `\n\n## 待办任务 (HEARTBEAT.md)\n\n${lines.join("\n")}\n\n请优先处理这些任务。`;
   }
 
   /**
@@ -605,7 +411,7 @@ export class HeartbeatManager {
     enabled: boolean;
     started: boolean;
     nextDueMs: number;
-    lastRunAt: number | null;
+    lastRunMs: number | null;
     intervalMs: number;
     activeHours?: ActiveHours;
   } {
@@ -613,13 +419,168 @@ export class HeartbeatManager {
       enabled: this.config.enabled,
       started: this.started,
       nextDueMs: this.state.nextDueMs,
-      lastRunAt: this.state.lastRunAt,
+      lastRunMs: this.state.lastRunMs,
       intervalMs: this.config.intervalMs,
       activeHours: this.config.activeHours,
     };
   }
+
+  // ============== 调度逻辑 ==============
+
+  /**
+   * 调度下一次运行
+   *
+   * 对应 OpenClaw heartbeat-runner.ts: scheduleNext()
+   * 使用 setTimeout 精确调度，每次运行后重新计算延迟
+   */
+  private scheduleNext(): void {
+    if (!this.started) return;
+
+    const now = Date.now();
+    const lastRun = this.state.lastRunMs ?? now;
+    const nextDue = lastRun + this.config.intervalMs;
+    this.state.nextDueMs = nextDue;
+
+    const delay = Math.max(0, nextDue - now);
+
+    this.state.timer = setTimeout(() => {
+      this.state.timer = null;
+      this.wake.request("interval");
+    }, delay);
+  }
+
+  /**
+   * 执行一次 Heartbeat
+   *
+   * 对应 OpenClaw heartbeat-runner.ts: runHeartbeatOnce()
+   * 流程:
+   * 1. 活跃时间窗口检查
+   * 2. 读取 HEARTBEAT.md 内容
+   * 3. 空内容检测 (exec 事件豁免)
+   * 4. 调用回调获取回复 (对应 getReplyFromConfig)
+   * 5. 重复消息抑制
+   * 6. 更新状态 + 调度下一次
+   */
+  private async runOnce(reason?: string): Promise<HeartbeatResult> {
+    const startMs = Date.now();
+    const wakeReason = (reason as WakeReason) || "requested";
+
+    // 1. 活跃时间窗口检查
+    if (!this.isWithinActiveHours(startMs)) {
+      this.state.lastRunMs = startMs;
+      this.scheduleNext();
+      return { status: "skipped", reason: "outside-active-hours" };
+    }
+
+    // 2. 读取 HEARTBEAT.md 内容（原样，不做解析）
+    const content = await this.readContent();
+
+    // 3. 空内容检测 — exec 事件豁免（对齐 openclaw: EXEC_EVENT_PROMPT 例外）
+    if (
+      (!content || isContentEffectivelyEmpty(content)) &&
+      wakeReason !== "exec"
+    ) {
+      this.state.lastRunMs = startMs;
+      this.scheduleNext();
+      return { status: "skipped", reason: "empty-content" };
+    }
+
+    // 4. 调用回调获取回复
+    if (!this.callback) {
+      this.state.lastRunMs = startMs;
+      this.scheduleNext();
+      return { status: "skipped", reason: "no-callback" };
+    }
+
+    try {
+      const result = await this.callback({
+        content: content ?? "",
+        reason: wakeReason,
+      });
+
+      const replyText = result?.text?.trim();
+      const durationMs = Date.now() - startMs;
+
+      // 空回复 = HEARTBEAT_OK（LLM 无话可说）
+      if (!replyText) {
+        this.state.lastRunMs = startMs;
+        this.scheduleNext();
+        return { status: "ran", durationMs, reason: "ack" };
+      }
+
+      // 5. 重复消息抑制
+      if (this.isDuplicateMessage(replyText, startMs)) {
+        this.state.lastRunMs = startMs;
+        this.scheduleNext();
+        return { status: "skipped", durationMs, reason: "duplicate-message" };
+      }
+
+      // 6. 更新状态
+      this.state.lastRunMs = startMs;
+      this.state.lastText = replyText;
+      this.state.lastTextAt = startMs;
+      this.scheduleNext();
+
+      return { status: "ran", durationMs };
+    } catch {
+      this.state.lastRunMs = startMs;
+      this.scheduleNext();
+      return { status: "failed", reason: "callback-error" };
+    }
+  }
+
+  // ============== 辅助方法 ==============
+
+  /**
+   * 检查是否在活跃时间窗口内
+   *
+   * 对应 OpenClaw heartbeat-runner.ts: isWithinActiveHours()
+   * 支持跨午夜的时间段 (如 22:00-06:00)
+   */
+  private isWithinActiveHours(nowMs: number): boolean {
+    const { activeHours } = this.config;
+    if (!activeHours) return true;
+
+    const date = new Date(nowMs);
+    const currentMinutes = date.getHours() * 60 + date.getMinutes();
+
+    const [startH, startM] = activeHours.start.split(":").map(Number);
+    const [endH, endM] = activeHours.end.split(":").map(Number);
+
+    const startMinutes = startH * 60 + startM;
+    const endMinutes = endH * 60 + endM;
+
+    // 跨午夜: 如 22:00-06:00
+    if (endMinutes <= startMinutes) {
+      return currentMinutes >= startMinutes || currentMinutes < endMinutes;
+    }
+
+    return currentMinutes >= startMinutes && currentMinutes < endMinutes;
+  }
+
+  /**
+   * 重复消息抑制
+   *
+   * 对应 OpenClaw heartbeat-runner.ts 中的 lastHeartbeatText/lastHeartbeatSentAt 检查:
+   * 24h 窗口内文本相同则跳过，防止频繁发送相同通知
+   */
+  private isDuplicateMessage(text: string, nowMs: number): boolean {
+    if (!this.state.lastText || !this.state.lastTextAt) {
+      return false;
+    }
+
+    const timeSinceLast = nowMs - this.state.lastTextAt;
+    if (timeSinceLast >= this.config.duplicateWindowMs) {
+      return false;
+    }
+
+    return text.trim() === this.state.lastText.trim();
+  }
+
+  private getHeartbeatPath(): string {
+    if (path.isAbsolute(this.config.heartbeatPath)) {
+      return this.config.heartbeatPath;
+    }
+    return path.join(this.workspaceDir, this.config.heartbeatPath);
+  }
 }
-
-// ============== 导出类型 ==============
-
-export type { HeartbeatHandler as HeartbeatCallback };

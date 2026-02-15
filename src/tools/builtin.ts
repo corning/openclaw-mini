@@ -511,7 +511,7 @@ export const memorySearchTool: Tool<{ query: string; limit?: number }> = {
     }
     const lines = results.map(
       (r, i) =>
-        `${i + 1}. [${r.entry.id}] score=${r.score.toFixed(2)} tags=${r.entry.tags.join(",") || "-"}\n   ${r.snippet}`,
+        `${i + 1}. [${r.entry.id}] score=${r.score.toFixed(2)} source=${r.entry.source}\n   ${r.snippet}`,
     );
     return lines.join("\n");
   },
@@ -562,7 +562,6 @@ export const memoryGetTool: Tool<{ id: string }> = {
  */
 export const memorySaveTool: Tool<{
   content: string;
-  tags?: string[];
 }> = {
   name: "memory_save",
   description: "将重要信息写入长期记忆（仅当信息值得长期保存时使用：用户偏好、关键决策、重要待办等）",
@@ -570,10 +569,6 @@ export const memorySaveTool: Tool<{
     type: "object",
     properties: {
       content: { type: "string", description: "要保存的内容" },
-      tags: {
-        type: "array",
-        description: "分类标签，便于后续检索",
-      },
     },
     required: ["content"],
   },
@@ -582,8 +577,7 @@ export const memorySaveTool: Tool<{
     if (!memory) {
       return "记忆系统未启用";
     }
-    const tags = Array.isArray(input.tags) ? input.tags.filter((t): t is string => typeof t === "string") : [];
-    const id = await memory.add(input.content, "agent", tags);
+    const id = await memory.add(input.content, "memory");
     return `已保存到长期记忆: ${id}`;
   },
 };

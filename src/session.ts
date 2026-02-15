@@ -179,20 +179,6 @@ export class SessionManager {
    */
   async append(sessionKey: string, message: Message): Promise<void> {
     const state = await this.ensureState(sessionKey);
-    const toolUses = extractToolUses(message);
-    const toolResultIds = extractToolResultIds(message);
-
-    if (!state.skipToolGuard) {
-      const hasToolResults = toolResultIds.length > 0;
-      if (state.pendingToolUses.size > 0) {
-        const shouldFlushBeforeMessage =
-          !hasToolResults && (toolUses.length === 0 || message.role !== "assistant");
-        const shouldFlushBeforeNewToolUses = toolUses.length > 0;
-        if (shouldFlushBeforeMessage || shouldFlushBeforeNewToolUses) {
-          await this.flushPendingToolResults(sessionKey, state);
-        }
-      }
-    }
 
     const entry: MessageEntry = {
       type: "message",
@@ -209,15 +195,6 @@ export class SessionManager {
       state.hasAssistant = true;
     }
     await this.persistEntry(state, entry);
-
-    if (!state.skipToolGuard) {
-      for (const id of toolResultIds) {
-        state.pendingToolUses.delete(id);
-      }
-      for (const call of toolUses) {
-        state.pendingToolUses.set(call.id, call.name);
-      }
-    }
   }
 
   /**
@@ -385,8 +362,6 @@ export class SessionManager {
         leafId: null,
         flushed: false,
         hasAssistant: false,
-        pendingToolUses: new Map<string, string | undefined>(),
-        skipToolGuard: false,
       };
     }
 
@@ -412,22 +387,6 @@ export class SessionManager {
     }
   }
 
-  private async flushPendingToolResults(sessionKey: string, state: SessionState): Promise<void> {
-    if (state.pendingToolUses.size === 0) {
-      return;
-    }
-    const pending = Array.from(state.pendingToolUses.entries());
-    state.pendingToolUses.clear();
-    state.skipToolGuard = true;
-    try {
-      for (const [id, name] of pending) {
-        const synthetic = createMissingToolResultMessage(id, name);
-        await this.append(sessionKey, synthetic);
-      }
-    } finally {
-      state.skipToolGuard = false;
-    }
-  }
 }
 
 type SessionState = {
@@ -439,8 +398,6 @@ type SessionState = {
   leafId: string | null;
   flushed: boolean;
   hasAssistant: boolean;
-  pendingToolUses: Map<string, string | undefined>;
-  skipToolGuard: boolean;
 };
 
 function generateId(byId: { has(id: string): boolean }): string {
@@ -478,61 +435,6 @@ function parseJsonlLines(content: string): unknown[] {
     }
   }
   return entries;
-}
-
-type ToolUseCall = { id: string; name?: string };
-
-function extractToolUses(message: Message): ToolUseCall[] {
-  if (message.role !== "assistant" || !Array.isArray(message.content)) {
-    return [];
-  }
-  const calls: ToolUseCall[] = [];
-  for (const block of message.content) {
-    if (block.type !== "tool_use") {
-      continue;
-    }
-    if (typeof block.id !== "string" || !block.id) {
-      continue;
-    }
-    calls.push({
-      id: block.id,
-      name: typeof block.name === "string" ? block.name : undefined,
-    });
-  }
-  return calls;
-}
-
-function extractToolResultIds(message: Message): string[] {
-  if (!Array.isArray(message.content)) {
-    return [];
-  }
-  const ids: string[] = [];
-  for (const block of message.content) {
-    if (block.type !== "tool_result") {
-      continue;
-    }
-    if (typeof block.tool_use_id !== "string" || !block.tool_use_id) {
-      continue;
-    }
-    ids.push(block.tool_use_id);
-  }
-  return ids;
-}
-
-function createMissingToolResultMessage(toolCallId: string, toolName?: string): Message {
-  const name = toolName ? ` (${toolName})` : "";
-  return {
-    role: "user",
-    content: [
-      {
-        type: "tool_result",
-        tool_use_id: toolCallId,
-        content:
-          `[openclaw-mini] 会话中缺失工具结果，已插入合成错误结果用于修复${name}。`,
-      },
-    ],
-    timestamp: Date.now(),
-  };
 }
 
 function buildSessionContext(state: SessionState): Message[] {
@@ -669,8 +571,6 @@ function buildStateFromEntries(
     leafId,
     flushed: true,
     hasAssistant,
-    pendingToolUses: new Map<string, string | undefined>(),
-    skipToolGuard: false,
   };
 }
 
@@ -718,8 +618,6 @@ function buildStateFromLegacy(filePath: string, messages: Message[]): SessionSta
     leafId,
     flushed: false,
     hasAssistant,
-    pendingToolUses: new Map<string, string | undefined>(),
-    skipToolGuard: false,
   };
 }
 

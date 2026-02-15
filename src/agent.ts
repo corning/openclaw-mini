@@ -9,13 +9,15 @@
  * 5. Heartbeat Manager - 主动唤醒机制
  *
  * 核心循环 (agent-loop.ts):
- *   while (tool_calls) {
- *     response = llm.generate(messages)
- *     for (tool of tool_calls) {
- *       result = tool.execute()
- *       messages.push(result)
- *     }
- *   }
+ *   OUTER LOOP (follow-ups)
+ *   ├─ INNER LOOP (tools + steering)
+ *   │  ├─ 注入 pendingMessages（steering 或 follow-up）
+ *   │  ├─ LLM 流式调用
+ *   │  ├─ 执行工具（每执行一个后检查 steering）
+ *   │  ├─ 若 steering: 跳过剩余工具
+ *   │  └─ 循环条件: hasMoreToolCalls || pendingMessages.length > 0
+ *   ├─ 检查 follow-up 消息
+ *   └─ 若有 follow-up: 继续外层循环
  */
 
 import crypto from "node:crypto";
@@ -39,7 +41,7 @@ import {
   resolveContextWindowInfo,
 } from "./context-window-guard.js";
 import { SkillManager, type SkillMatch } from "./skills.js";
-import { HeartbeatManager, type HeartbeatTask, type WakeRequest, type HeartbeatResult } from "./heartbeat.js";
+import { HeartbeatManager, type HeartbeatResult } from "./heartbeat.js";
 import {
   normalizeAgentId,
   resolveAgentIdFromSessionKey,
@@ -47,9 +49,10 @@ import {
   isSubagentSessionKey,
 } from "./session-key.js";
 import { enqueueInLane, resolveGlobalLane, resolveSessionLane, setLaneConcurrency } from "./command-queue.js";
-import { filterToolsByPolicy, mergeToolPolicies, type ToolPolicy } from "./tool-policy.js";
+import { filterToolsByPolicy, type ToolPolicy } from "./tool-policy.js";
 import { emitAgentEvent } from "./agent-events.js";
 import { runAgentLoop } from "./agent-loop.js";
+import { installSessionToolResultGuard } from "./session-tool-result-guard.js";
 import type { Model, StreamFunction } from "@mariozechner/pi-ai";
 import { streamSimple, completeSimple, getModel } from "@mariozechner/pi-ai";
 
@@ -138,8 +141,8 @@ export interface AgentCallbacks {
   onSkillMatch?: (match: SkillMatch) => void;
   /** 记忆检索 */
   onMemorySearch?: (results: MemorySearchResult[]) => void;
-  /** Heartbeat 任务触发 */
-  onHeartbeat?: (tasks: HeartbeatTask[]) => void;
+  /** Heartbeat 触发（传入 HEARTBEAT.md 原始内容，不做解析） */
+  onHeartbeat?: (content: string) => void;
 }
 
 export interface RunResult {
@@ -237,6 +240,15 @@ export class Agent {
    */
   private steeringQueues = new Map<string, string[]>();
 
+  /**
+   * Tool Result Guard
+   *
+   * 对应 OpenClaw: session-tool-result-guard-wrapper.ts → guardSessionManager()
+   * - 追踪 pending tool_use，自动合成缺失的 tool_result
+   * - 防止 LLM API 因 tool_use/tool_result 不配对而拒绝
+   */
+  private toolResultGuard: ReturnType<typeof installSessionToolResultGuard>;
+
   constructor(config: AgentConfig) {
     // Provider 初始化（对应 OpenClaw: attempt.ts → activeSession.agent.streamFn）
     const modelId = config.model ?? "claude-sonnet-4-20250514";
@@ -275,9 +287,12 @@ export class Agent {
     this.enableSkills = config.enableSkills ?? true;
     this.enableHeartbeat = config.enableHeartbeat ?? false;
 
-    // Global lane 并发数（对应 OpenClaw resolveAgentMaxConcurrent）
+    // Global lane 并发数（对应 OpenClaw: DEFAULT_AGENT_MAX_CONCURRENT = 4）
     const globalLane = resolveGlobalLane();
-    setLaneConcurrency(globalLane, config.maxConcurrentRuns ?? 2);
+    setLaneConcurrency(globalLane, config.maxConcurrentRuns ?? 4);
+
+    // Tool Result Guard（对应 OpenClaw: attempt.ts → guardSessionManager()）
+    this.toolResultGuard = installSessionToolResultGuard(this.sessions);
   }
 
   /**
@@ -352,9 +367,11 @@ export class Agent {
       );
     }
 
+    // 对应 OpenClaw: isToolAllowedByPolicies() — 多策略交集（all must allow）
     const sandboxPolicy = this.buildSandboxToolPolicy();
-    const effectivePolicy = mergeToolPolicies(this.toolPolicy, sandboxPolicy);
-    return filterToolsByPolicy(tools, effectivePolicy);
+    let filtered = filterToolsByPolicy(tools, this.toolPolicy);
+    filtered = filterToolsByPolicy(filtered, sandboxPolicy);
+    return filtered;
   }
 
   /**
@@ -588,13 +605,9 @@ export class Agent {
             }
           }
 
-          // Heartbeat 任务注入
-          if (this.enableHeartbeat) {
-            const tasksPrompt = await this.heartbeat.buildTasksPrompt();
-            if (tasksPrompt) {
-              processedMessage += tasksPrompt;
-            }
-          }
+          // Heartbeat: 不在此注入任务到消息
+          // 对齐 openclaw: heartbeat 是独立的主动通知系统，
+          // 读取 HEARTBEAT.md 并传递给 LLM，不会注入到用户消息中
 
           // 添加用户消息
           const userMsg: Message = {
@@ -643,6 +656,18 @@ export class Agent {
           const toolsForRun = rawTools.map((t) => wrapToolWithAbortSignal(t, runAbortController.signal));
 
           // ===== Agent Loop（提取到 agent-loop.ts） =====
+          // 对应 OpenClaw: getSteeringMessages — 异步回调，drain 队列并转为 Message[]
+          const getSteeringMessages = async (): Promise<Message[]> => {
+            const queue = this.steeringQueues.get(sessionKey);
+            if (!queue || queue.length === 0) return [];
+            const drained = queue.splice(0);
+            return drained.map((text) => ({
+              role: "user" as const,
+              content: text,
+              timestamp: Date.now(),
+            }));
+          };
+
           const loopResult = await runAgentLoop({
             runId,
             sessionKey,
@@ -658,7 +683,7 @@ export class Agent {
             temperature: this.temperature,
             maxTurns: this.maxTurns,
             contextTokens: this.contextTokens,
-            steeringQueues: this.steeringQueues,
+            getSteeringMessages,
             callbacks,
             appendMessage: (sk, msg) => this.sessions.append(sk, msg),
             prepareCompaction: async (p) => {
@@ -706,6 +731,8 @@ export class Agent {
           });
           throw err;
         } finally {
+          // 对应 OpenClaw: attempt.ts finally → flushPendingToolResults()
+          await this.toolResultGuard.flushPendingToolResults(sessionKey);
           this.runAbortControllers.delete(runId);
         }
       }),
@@ -746,12 +773,16 @@ export class Agent {
 
   /**
    * 启动 Heartbeat 监控
+   *
+   * 对齐 openclaw: heartbeat 是独立的主动通知系统，
+   * 回调接收 HEARTBEAT.md 原始内容（不做任务解析），
+   * 由调用方决定如何处理（通常是调用 LLM）
    */
-  startHeartbeat(callback?: (tasks: HeartbeatTask[], request: WakeRequest) => void): void {
+  startHeartbeat(callback?: (content: string, reason: string) => void): void {
     if (callback) {
-      this.heartbeat.onTasks(async (tasks, request): Promise<HeartbeatResult> => {
-        callback(tasks, request);
-        return { status: "ok", tasks };
+      this.heartbeat.onHeartbeat(async (opts): Promise<{ text?: string } | null> => {
+        callback(opts.content, opts.reason);
+        return null;
       });
     }
     this.heartbeat.start();
@@ -767,7 +798,7 @@ export class Agent {
   /**
    * 手动触发 Heartbeat 检查
    */
-  async triggerHeartbeat(): Promise<HeartbeatTask[]> {
+  async triggerHeartbeat(): Promise<HeartbeatResult> {
     return this.heartbeat.trigger();
   }
 

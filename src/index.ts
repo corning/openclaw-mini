@@ -48,6 +48,7 @@ export { type ToolPolicy, filterToolsByPolicy } from "./tool-policy.js";
 export {
   MemoryManager,
   type MemoryEntry,
+  type MemorySource,
   type MemorySearchResult,
 } from "./memory.js";
 
@@ -67,7 +68,6 @@ export {
 // 主动唤醒
 export {
   HeartbeatManager,
-  type HeartbeatTask,
   type HeartbeatConfig,
   type HeartbeatCallback,
   type HeartbeatResult,

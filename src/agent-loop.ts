@@ -1,13 +1,21 @@
 /**
  * Agent 主循环
  *
- * 对应 OpenClaw: pi-embedded-runner/run/attempt.ts — 主循环部分
+ * 对应 OpenClaw: pi-agent-core → agent-loop.ts — runLoop()
  *
  * 从 Agent 类中提取的纯函数: 接收所有依赖，不访问 Agent 实例状态。
- * 职责:
- * - 每轮 prune → LLM 流式调用 → 工具串行执行
- * - Context overflow → auto-compact → 重试
- * - Steering 中断检测
+ *
+ * 双层循环结构 (对齐 openclaw):
+ *
+ * OUTER LOOP (follow-ups)
+ * ├─ INNER LOOP (tools + steering)
+ * │  ├─ 注入 pendingMessages（steering 或 follow-up）
+ * │  ├─ LLM 流式调用
+ * │  ├─ 执行工具（每执行一个后检查 steering）
+ * │  ├─ 若 steering: 跳过剩余工具（每个被跳过的工具生成 skipToolCall 结果）
+ * │  └─ 循环条件: hasMoreToolCalls || pendingMessages.length > 0
+ * ├─ 检查 follow-up 消息
+ * └─ 若有 follow-up: 继续外层循环
  */
 
 import type { Tool, ToolContext } from "./tools/types.js";
@@ -47,7 +55,22 @@ export interface AgentLoopParams {
   temperature?: number;
   maxTurns: number;
   contextTokens: number;
-  steeringQueues: Map<string, string[]>;
+  /**
+   * 获取 steering 消息
+   *
+   * 对应 OpenClaw: pi-agent-core → AgentLoopConfig.getSteeringMessages
+   * - 每执行完一个工具后调用
+   * - 返回非空数组时跳过剩余工具，注入到下一轮
+   */
+  getSteeringMessages: () => Promise<Message[]>;
+  /**
+   * 获取 follow-up 消息
+   *
+   * 对应 OpenClaw: pi-agent-core → AgentLoopConfig.getFollowUpMessages
+   * - 内层循环结束后（agent 本来要停下）调用
+   * - 返回非空数组时继续外层循环
+   */
+  getFollowUpMessages?: () => Promise<Message[]>;
   /** 回调 */
   callbacks?: AgentLoopCallbacks;
   /** 持久化 */
@@ -80,6 +103,25 @@ export interface AgentLoopResult {
   totalToolCalls: number;
 }
 
+// ============== skipToolCall (对齐 openclaw) ==============
+
+/**
+ * 为被跳过的工具生成占位结果
+ *
+ * 对应 OpenClaw: pi-agent-core → skipToolCall()
+ * - isError: true，标记为错误结果
+ * - 消息: "Skipped due to queued user message."
+ * - 保持消息结构完整，便于 LLM 理解上下文
+ */
+function skipToolCall(call: { id: string; name: string }): ContentBlock {
+  return {
+    type: "tool_result",
+    tool_use_id: call.id,
+    name: call.name,
+    content: "Skipped due to queued user message.",
+  };
+}
+
 // ============== 主循环 ==============
 
 export async function runAgentLoop(params: AgentLoopParams): Promise<AgentLoopResult> {
@@ -97,7 +139,8 @@ export async function runAgentLoop(params: AgentLoopParams): Promise<AgentLoopRe
     temperature,
     maxTurns,
     contextTokens,
-    steeringQueues,
+    getSteeringMessages,
+    getFollowUpMessages,
     callbacks,
     appendMessage,
     prepareCompaction,
@@ -110,263 +153,311 @@ export async function runAgentLoop(params: AgentLoopParams): Promise<AgentLoopRe
   let finalText = "";
   let overflowCompactionAttempted = false;
 
-  while (turns < maxTurns) {
-    turns++;
-    callbacks?.onTurnStart?.(turns);
+  // 对应 OpenClaw: 循环开始前检查 steering（用户可能在等待期间输入）
+  let pendingMessages = await getSteeringMessages();
 
-    // ===== Prune: 每轮都执行 =====
-    const pruneResult = pruneContextMessages({
-      messages: currentMessages,
-      contextWindowTokens: contextTokens,
-    });
-    let messagesForModel = pruneResult.messages;
-    if (compactionSummary) {
-      messagesForModel = [compactionSummary, ...messagesForModel];
-    }
+  // ========== 外层循环 (follow-ups) ==========
+  // 对应 OpenClaw: agent-loop.js outer while(true) loop
+  outerLoop: while (true) {
+    let hasMoreToolCalls = true;
 
-    // abort 检查
-    if (abortSignal.aborted) break;
+    // ========== 内层循环 (tools + steering) ==========
+    // 对应 OpenClaw: inner while (hasMoreToolCalls || pendingMessages.length > 0)
+    while (hasMoreToolCalls || pendingMessages.length > 0) {
+      if (turns >= maxTurns) break outerLoop;
+      if (abortSignal.aborted) break outerLoop;
 
-    // 构造 pi-ai Context
-    const piContext: PiContext = {
-      systemPrompt,
-      messages: convertMessagesToPi(messagesForModel, modelDef),
-      tools: toolsForRun.map((t) => ({
-        name: t.name,
-        description: t.description,
-        parameters: t.inputSchema as any,
-      })),
-    };
+      turns++;
+      callbacks?.onTurnStart?.(turns);
 
-    // ===== 带重试的 LLM 调用 =====
-    const assistantContent: ContentBlock[] = [];
-    const toolCalls: { id: string; name: string; input: Record<string, unknown> }[] = [];
-    const turnTextParts: string[] = [];
+      // 注入 pending 消息（steering 或 follow-up）
+      if (pendingMessages.length > 0) {
+        for (const msg of pendingMessages) {
+          await appendMessage(sessionKey, msg);
+          currentMessages.push(msg);
+        }
+        pendingMessages = [];
+      }
 
-    try {
-      await retryAsync(
-        async () => {
-          assistantContent.length = 0;
-          toolCalls.length = 0;
-          turnTextParts.length = 0;
+      // ===== Prune: 每轮都执行 =====
+      const pruneResult = pruneContextMessages({
+        messages: currentMessages,
+        contextWindowTokens: contextTokens,
+      });
+      let messagesForModel = pruneResult.messages;
+      if (compactionSummary) {
+        messagesForModel = [compactionSummary, ...messagesForModel];
+      }
 
-          const streamOpts: SimpleStreamOptions = {
-            maxTokens: modelDef.maxTokens,
-            signal: abortSignal,
-            apiKey,
-            ...(temperature !== undefined ? { temperature } : {}),
-          };
-          const eventStream = streamFn(modelDef, piContext, streamOpts);
+      // 构造 pi-ai Context
+      const piContext: PiContext = {
+        systemPrompt,
+        messages: convertMessagesToPi(messagesForModel, modelDef),
+        tools: toolsForRun.map((t) => ({
+          name: t.name,
+          description: t.description,
+          parameters: t.inputSchema as any,
+        })),
+      };
 
-          for await (const event of eventStream) {
-            if (abortSignal.aborted) break;
+      // ===== 带重试的 LLM 调用 =====
+      const assistantContent: ContentBlock[] = [];
+      const toolCalls: { id: string; name: string; input: Record<string, unknown> }[] = [];
+      const turnTextParts: string[] = [];
 
-            switch (event.type) {
-              case "text_delta":
-                callbacks?.onTextDelta?.(event.delta);
-                emitAgentEvent({
-                  runId,
-                  stream: "assistant",
-                  sessionKey,
-                  agentId,
-                  data: { delta: event.delta },
-                });
-                break;
+      try {
+        await retryAsync(
+          async () => {
+            assistantContent.length = 0;
+            toolCalls.length = 0;
+            turnTextParts.length = 0;
 
-              case "text_end":
-                turnTextParts.push(event.content);
-                assistantContent.push({ type: "text", text: event.content });
-                break;
+            const streamOpts: SimpleStreamOptions = {
+              maxTokens: modelDef.maxTokens,
+              signal: abortSignal,
+              apiKey,
+              ...(temperature !== undefined ? { temperature } : {}),
+            };
+            const eventStream = streamFn(modelDef, piContext, streamOpts);
 
-              case "toolcall_start":
-                break;
+            for await (const event of eventStream) {
+              if (abortSignal.aborted) break;
 
-              case "toolcall_end": {
-                const tc = event.toolCall;
-                const tcArgs = tc.arguments as Record<string, unknown>;
-                callbacks?.onToolStart?.(tc.name, tcArgs);
-                emitAgentEvent({
-                  runId,
-                  stream: "tool",
-                  sessionKey,
-                  agentId,
-                  data: { phase: "start", name: tc.name, input: tcArgs },
-                });
-                assistantContent.push({
-                  type: "tool_use",
-                  id: tc.id,
-                  name: tc.name,
-                  input: tcArgs,
-                });
-                toolCalls.push({
-                  id: tc.id,
-                  name: tc.name,
-                  input: tcArgs,
-                });
-                break;
+              switch (event.type) {
+                case "text_delta":
+                  callbacks?.onTextDelta?.(event.delta);
+                  emitAgentEvent({
+                    runId,
+                    stream: "assistant",
+                    sessionKey,
+                    agentId,
+                    data: { delta: event.delta },
+                  });
+                  break;
+
+                case "text_end":
+                  turnTextParts.push(event.content);
+                  assistantContent.push({ type: "text", text: event.content });
+                  break;
+
+                case "toolcall_start":
+                  break;
+
+                case "toolcall_end": {
+                  const tc = event.toolCall;
+                  const tcArgs = tc.arguments as Record<string, unknown>;
+                  assistantContent.push({
+                    type: "tool_use",
+                    id: tc.id,
+                    name: tc.name,
+                    input: tcArgs,
+                  });
+                  toolCalls.push({
+                    id: tc.id,
+                    name: tc.name,
+                    input: tcArgs,
+                  });
+                  break;
+                }
               }
             }
-          }
 
-          // 等待流完成（确保本轮 stream settle 后才可能进入重试）
-          const result = eventStream.result();
-          await abortable(result, abortSignal);
-        },
-        {
-          attempts: 3,
-          minDelayMs: 300,
-          maxDelayMs: 30_000,
-          jitter: 0.1,
-          label: "llm-call",
-          shouldRetry: (err) => {
-            if (abortSignal.aborted) return false;
-            return isRateLimitError(describeError(err));
+            const result = eventStream.result();
+            await abortable(result, abortSignal);
           },
-          onRetry: ({ attempt, delay, error }) => {
+          {
+            attempts: 3,
+            minDelayMs: 300,
+            maxDelayMs: 30_000,
+            jitter: 0.1,
+            label: "llm-call",
+            shouldRetry: (err) => {
+              if (abortSignal.aborted) return false;
+              return isRateLimitError(describeError(err));
+            },
+            onRetry: ({ attempt, delay, error }) => {
+              emitAgentEvent({
+                runId,
+                stream: "lifecycle",
+                sessionKey,
+                agentId,
+                data: { phase: "retry", attempt, delay, error: describeError(error) },
+              });
+            },
+          },
+        );
+      } catch (llmError) {
+        // Context overflow → auto-compact → 重试一次
+        const errorText = describeError(llmError);
+        if (isContextOverflowError(errorText) && !overflowCompactionAttempted) {
+          overflowCompactionAttempted = true;
+          emitAgentEvent({
+            runId,
+            stream: "lifecycle",
+            sessionKey,
+            agentId,
+            data: { phase: "context_overflow_compact", error: errorText },
+          });
+          const overflowPrep = await prepareCompaction({
+            messages: currentMessages,
+            sessionKey,
+            runId,
+          });
+          if (overflowPrep.summary && overflowPrep.summaryMessage) {
+            compactionSummary = overflowPrep.summaryMessage;
+            turns--;
+            continue;
+          }
+        }
+        throw llmError;
+      }
+
+      // 保存 assistant 消息
+      const assistantMsg: Message = {
+        role: "assistant",
+        content: assistantContent,
+        timestamp: Date.now(),
+      };
+      await appendMessage(sessionKey, assistantMsg);
+      currentMessages.push(assistantMsg);
+
+      const turnText = turnTextParts.join("");
+      if (turnText) {
+        callbacks?.onTextComplete?.(turnText);
+        emitAgentEvent({
+          runId,
+          stream: "assistant",
+          sessionKey,
+          agentId,
+          data: { text: turnText, final: true },
+        });
+      }
+
+      hasMoreToolCalls = toolCalls.length > 0;
+
+      // 没有工具调用 → 内层循环结束条件之一
+      if (!hasMoreToolCalls) {
+        finalText = turnText;
+        callbacks?.onTurnEnd?.(turns);
+        // 检查是否有 steering 消息待处理
+        pendingMessages = await getSteeringMessages();
+        continue;
+      }
+
+      // ===== 执行工具（串行 + steering 中断检测） =====
+      // 对应 OpenClaw: executeToolCalls() + getSteeringMessages 检查
+      const toolResults: ContentBlock[] = [];
+      let steeringMessages: Message[] | null = null;
+
+      for (let i = 0; i < toolCalls.length; i++) {
+        const call = toolCalls[i];
+        const tool = toolsForRun.find((t) => t.name === call.name);
+        let result: string;
+
+        callbacks?.onToolStart?.(call.name, call.input);
+        emitAgentEvent({
+          runId,
+          stream: "tool",
+          sessionKey,
+          agentId,
+          data: { phase: "start", name: call.name, input: call.input },
+        });
+
+        if (tool) {
+          try {
+            result = await tool.execute(call.input, toolCtx);
+          } catch (err) {
+            result = `执行错误: ${(err as Error).message}`;
+          }
+        } else {
+          result = `未知工具: ${call.name}`;
+        }
+
+        totalToolCalls++;
+        callbacks?.onToolEnd?.(call.name, result);
+        emitAgentEvent({
+          runId,
+          stream: "tool",
+          sessionKey,
+          agentId,
+          data: {
+            phase: "end",
+            name: call.name,
+            output: result.length > 500 ? `${result.slice(0, 500)}...` : result,
+          },
+        });
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: call.id,
+          name: call.name,
+          content: result,
+        });
+
+        // 对应 OpenClaw: 每执行完一个工具检查 steering
+        const steering = await getSteeringMessages();
+        if (steering.length > 0) {
+          steeringMessages = steering;
+          // 对应 OpenClaw: skipToolCall() — 跳过剩余工具
+          const remaining = toolCalls.slice(i + 1);
+          for (const skipped of remaining) {
             emitAgentEvent({
               runId,
-              stream: "lifecycle",
+              stream: "tool",
               sessionKey,
               agentId,
-              data: { phase: "retry", attempt, delay, error: describeError(error) },
+              data: { phase: "start", name: skipped.name, input: skipped.input },
             });
-          },
-        },
-      );
-    } catch (llmError) {
-      // Context overflow → auto-compact → 重试一次
-      const errorText = describeError(llmError);
-      if (isContextOverflowError(errorText) && !overflowCompactionAttempted) {
-        overflowCompactionAttempted = true;
-        emitAgentEvent({
-          runId,
-          stream: "lifecycle",
-          sessionKey,
-          agentId,
-          data: { phase: "context_overflow_compact", error: errorText },
-        });
-        const overflowPrep = await prepareCompaction({
-          messages: currentMessages,
-          sessionKey,
-          runId,
-        });
-        if (overflowPrep.summary && overflowPrep.summaryMessage) {
-          compactionSummary = overflowPrep.summaryMessage;
-          turns--;
-          continue;
+            emitAgentEvent({
+              runId,
+              stream: "tool",
+              sessionKey,
+              agentId,
+              data: { phase: "end", name: skipped.name, output: "Skipped due to queued user message." },
+            });
+            toolResults.push(skipToolCall(skipped));
+          }
+          emitAgentEvent({
+            runId,
+            stream: "lifecycle",
+            sessionKey,
+            agentId,
+            data: { phase: "steering", pendingMessages: steering.length },
+          });
+          break;
         }
       }
-      throw llmError;
-    }
 
-    // 保存 assistant 消息
-    const assistantMsg: Message = {
-      role: "assistant",
-      content: assistantContent,
-      timestamp: Date.now(),
-    };
-    await appendMessage(sessionKey, assistantMsg);
-    currentMessages.push(assistantMsg);
+      // 添加工具结果（含 skip 结果）
+      const resultMsg: Message = {
+        role: "user",
+        content: toolResults,
+        timestamp: Date.now(),
+      };
+      await appendMessage(sessionKey, resultMsg);
+      currentMessages.push(resultMsg);
 
-    callbacks?.onTurnEnd?.(turns);
+      callbacks?.onTurnEnd?.(turns);
 
-    const turnText = turnTextParts.join("");
-    if (turnText) {
-      callbacks?.onTextComplete?.(turnText);
-      emitAgentEvent({
-        runId,
-        stream: "assistant",
-        sessionKey,
-        agentId,
-        data: { text: turnText, final: true },
-      });
-    }
-
-    // 没有工具调用 → 结束
-    if (toolCalls.length === 0) {
-      finalText = turnText;
-      break;
-    }
-
-    // ===== 执行工具（串行 + steering 中断检测） =====
-    const toolResults: ContentBlock[] = [];
-    let steered = false;
-
-    for (const call of toolCalls) {
-      const tool = toolsForRun.find((t) => t.name === call.name);
-      let result: string;
-
-      if (tool) {
-        try {
-          result = await tool.execute(call.input, toolCtx);
-        } catch (err) {
-          result = `执行错误: ${(err as Error).message}`;
-        }
+      // 对应 OpenClaw: steering 消息设为 pendingMessages，下一轮注入
+      if (steeringMessages && steeringMessages.length > 0) {
+        pendingMessages = steeringMessages;
       } else {
-        result = `未知工具: ${call.name}`;
-      }
-
-      totalToolCalls++;
-      callbacks?.onToolEnd?.(call.name, result);
-      emitAgentEvent({
-        runId,
-        stream: "tool",
-        sessionKey,
-        agentId,
-        data: {
-          phase: "end",
-          name: call.name,
-          output: result.length > 500 ? `${result.slice(0, 500)}...` : result,
-        },
-      });
-      toolResults.push({
-        type: "tool_result",
-        tool_use_id: call.id,
-        name: call.name,
-        content: result,
-      });
-
-      // Steering 检查
-      const steeringQueue = steeringQueues.get(sessionKey);
-      if (steeringQueue && steeringQueue.length > 0) {
-        steered = true;
-        emitAgentEvent({
-          runId,
-          stream: "lifecycle",
-          sessionKey,
-          agentId,
-          data: { phase: "steering", pendingMessages: steeringQueue.length },
-        });
-        break;
+        pendingMessages = await getSteeringMessages();
       }
     }
+    // ========== 内层循环结束 ==========
 
-    // 添加已执行的工具结果
-    const resultMsg: Message = {
-      role: "user",
-      content: toolResults,
-      timestamp: Date.now(),
-    };
-    await appendMessage(sessionKey, resultMsg);
-    currentMessages.push(resultMsg);
-
-    // 处理 steering 消息
-    if (steered) {
-      const steeringQueue = steeringQueues.get(sessionKey);
-      if (steeringQueue && steeringQueue.length > 0) {
-        const steeringText = steeringQueue.join("\n");
-        steeringQueue.length = 0;
-
-        const steeringMsg: Message = {
-          role: "user",
-          content: steeringText,
-          timestamp: Date.now(),
-        };
-        await appendMessage(sessionKey, steeringMsg);
-        currentMessages.push(steeringMsg);
+    // 对应 OpenClaw: 检查 follow-up 消息
+    if (getFollowUpMessages) {
+      const followUp = await getFollowUpMessages();
+      if (followUp.length > 0) {
+        pendingMessages = followUp;
+        continue;
       }
     }
+    break;
   }
+  // ========== 外层循环结束 ==========
 
   return { finalText, turns, totalToolCalls };
 }

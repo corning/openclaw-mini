@@ -22,6 +22,7 @@ export {
   pruneContextMessages,
   resolvePruningSettings,
   type ContextPruningSettings,
+  type ContextPruningToolMatch,
   type PruneResult,
 } from "./pruning.js";
 export {
@@ -29,8 +30,9 @@ export {
   compactHistoryIfNeeded,
   computeAdaptiveChunkRatio,
   shouldTriggerCompaction,
+  type CompactionSettings,
   type SummarizeFn,
-  DEFAULT_COMPACTION_TRIGGER_RATIO,
+  DEFAULT_COMPACTION_SETTINGS,
   DEFAULT_SUMMARY_MAX_TOKENS,
   DEFAULT_CONTEXT_WINDOW_TOKENS,
 } from "./compaction.js";
