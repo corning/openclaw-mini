@@ -3,3 +3,7 @@ dist/
 .mini-agent/
 *.log
 .DS_Store
+.idea
+.vscode
+.env
+.openclaw-mini

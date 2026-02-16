@@ -31,6 +31,7 @@ import type {
   StreamFunction,
   SimpleStreamOptions,
   Context as PiContext,
+  ThinkingLevel,
 } from "@mariozechner/pi-ai";
 import {
   retryAsync,
@@ -59,6 +60,8 @@ export interface AgentLoopParams {
   streamFn: StreamFunction;
   apiKey?: string;
   temperature?: number;
+  /** 思考级别: 传入后启用 extended thinking */
+  reasoning?: ThinkingLevel;
   maxTurns: number;
   contextTokens: number;
   /**
@@ -138,6 +141,7 @@ export function runAgentLoop(params: AgentLoopParams): EventStream<MiniAgentEven
       streamFn,
       apiKey,
       temperature,
+      reasoning,
       maxTurns,
       contextTokens,
       getSteeringMessages,
@@ -191,9 +195,10 @@ export function runAgentLoop(params: AgentLoopParams): EventStream<MiniAgentEven
           }
 
           // 构造 pi-ai Context
+          const piMessages = convertMessagesToPi(messagesForModel, modelDef);
           const piContext: PiContext = {
             systemPrompt,
-            messages: convertMessagesToPi(messagesForModel, modelDef),
+            messages: piMessages,
             tools: toolsForRun.map((t) => ({
               name: t.name,
               description: t.description,
@@ -218,6 +223,7 @@ export function runAgentLoop(params: AgentLoopParams): EventStream<MiniAgentEven
                   signal: abortSignal,
                   apiKey,
                   ...(temperature !== undefined ? { temperature } : {}),
+                  ...(reasoning ? { reasoning } : {}),
                 };
                 const eventStream = streamFn(modelDef, piContext, streamOpts);
 
@@ -225,6 +231,15 @@ export function runAgentLoop(params: AgentLoopParams): EventStream<MiniAgentEven
                   if (abortSignal.aborted) break;
 
                   switch (event.type) {
+                    case "thinking_delta":
+                      stream.push({ type: "thinking_delta", delta: (event as any).delta });
+                      break;
+
+                    case "thinking_end":
+                      // thinking 内容保存到 assistant message（对齐 pi-agent-core）
+                      // 但不计入 turnTextParts（思考不是最终输出）
+                      break;
+
                     case "text_delta":
                       stream.push({ type: "message_delta", delta: event.delta });
                       break;
@@ -252,6 +267,18 @@ export function runAgentLoop(params: AgentLoopParams): EventStream<MiniAgentEven
                         input: tcArgs,
                       });
                       break;
+                    }
+
+                    // pi-ai 的 error 事件: API 错误、网络错误等
+                    // AssistantMessageEventStream 将 error 事件 resolve（非 reject），
+                    // 必须在这里显式抛出，否则错误被静默吞掉
+                    case "error": {
+                      const errObj = (event as any).error;
+                      const errMsg =
+                        errObj?.errorMessage ??
+                        (errObj instanceof Error ? errObj.message : null) ??
+                        "unknown stream error";
+                      throw new Error(`LLM stream error: ${errMsg}`);
                     }
                   }
                 }

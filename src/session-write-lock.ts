@@ -49,6 +49,7 @@ export async function acquireSessionWriteLock(params: {
   while (Date.now() - startedAt < timeoutMs) {
     attempt += 1;
     try {
+      await fs.mkdir(path.dirname(lockPath), { recursive: true });
       const handle = await fs.open(lockPath, "wx");
       await handle.writeFile(
         JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }, null, 2),

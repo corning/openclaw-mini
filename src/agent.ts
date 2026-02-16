@@ -53,7 +53,7 @@ import { filterToolsByPolicy, type ToolPolicy } from "./tool-policy.js";
 import type { MiniAgentEvent } from "./agent-events.js";
 import { runAgentLoop } from "./agent-loop.js";
 import { installSessionToolResultGuard } from "./session-tool-result-guard.js";
-import type { Model, StreamFunction } from "@mariozechner/pi-ai";
+import type { Model, StreamFunction, ThinkingLevel } from "@mariozechner/pi-ai";
 import { streamSimple, completeSimple, getModel, getEnvApiKey } from "@mariozechner/pi-ai";
 
 // ============== 类型定义 ==============
@@ -70,6 +70,10 @@ export interface AgentConfig {
   provider?: string;
   /** 模型 ID（需与 provider 匹配，如 "claude-sonnet-4-20250514" / "gpt-4.1" / "gemini-2.5-pro"） */
   model?: string;
+  /** API Base URL（用于代理、自部署端点、Azure OpenAI 等） */
+  baseUrl?: string;
+  /** 自定义 HTTP headers（覆盖 pi-ai 默认的 beta headers 等，值为 null 表示移除） */
+  headers?: Record<string, string | null>;
   /**
    * Provider 流式调用函数
    *
@@ -101,6 +105,8 @@ export interface AgentConfig {
   };
   /** 温度参数（0-1，对应 OpenClaw: agents.defaults.models[provider/model].params.temperature） */
   temperature?: number;
+  /** 思考级别: minimal / low / medium / high / xhigh */
+  reasoning?: ThinkingLevel;
   /** 最大循环次数 */
   maxTurns?: number;
   /** 会话存储目录 */
@@ -181,6 +187,7 @@ export class Agent {
   private modelDef: Model<any>;
   private apiKey?: string;
   private temperature?: number;
+  private reasoning?: ThinkingLevel;
   private agentId: string;
   private baseSystemPrompt: string;
   private tools: Tool[];
@@ -248,7 +255,60 @@ export class Agent {
     // Provider 初始化（对应 OpenClaw: attempt.ts → activeSession.agent.streamFn）
     const provider = config.provider ?? "anthropic";
     const modelId = config.model ?? (provider === "anthropic" ? "claude-sonnet-4-20250514" : undefined);
-    this.modelDef = config.modelDef ?? getModel(provider as any, modelId as any);
+
+    // 解析 Model 定义
+    // 代理场景下 model ID 可能不在 pi-ai 注册表中（如 "anthropic/claude-sonnet-4.5"）
+    // 此时根据 provider 构造兼容的 Model 定义
+    const API_FOR_PROVIDER: Record<string, string> = {
+      anthropic: "anthropic-messages",
+      openai: "openai-completions",
+      google: "google-generative-ai",
+    };
+    let modelDef: Model<any> | undefined = config.modelDef ?? getModel(provider as any, modelId as any);
+    if (!modelDef && modelId) {
+      const api = API_FOR_PROVIDER[provider];
+      if (!api) {
+        throw new Error(`未知 provider: ${provider}，请指定 modelDef。`);
+      }
+      modelDef = {
+        id: modelId,
+        name: modelId,
+        api,
+        provider,
+        baseUrl: config.baseUrl ?? "",
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 200_000,
+        maxTokens: 8192,
+      };
+    }
+    if (!modelDef) {
+      throw new Error(`未知模型: provider=${provider} model=${modelId}`);
+    }
+    // 使用代理时剥离 Anthropic SDK 和 pi-ai 添加的非标准 headers
+    // 代理通常会拒绝 SDK 的 User-Agent / X-Stainless-* tracking headers
+    // Anthropic SDK applyHeadersMut: null → 删除, undefined → 跳过
+    if (config.baseUrl) {
+      this.modelDef = {
+        ...modelDef,
+        baseUrl: config.baseUrl,
+        headers: {
+          "User-Agent": null,
+          "X-Stainless-Lang": null,
+          "X-Stainless-Package-Version": null,
+          "X-Stainless-OS": null,
+          "X-Stainless-Arch": null,
+          "X-Stainless-Runtime": null,
+          "X-Stainless-Runtime-Version": null,
+          "anthropic-dangerous-direct-browser-access": null,
+          "anthropic-beta": null,
+          ...config.headers,
+        } as any,
+      };
+    } else {
+      this.modelDef = config.headers ? { ...modelDef, headers: { ...modelDef.headers, ...config.headers } as any } : modelDef;
+    }
     this.streamFn = config.streamFn ?? streamSimple;
     this.agentId = normalizeAgentId(config.agentId ?? "main");
     this.baseSystemPrompt = config.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
@@ -257,6 +317,7 @@ export class Agent {
     this.workspaceDir = config.workspaceDir ?? process.cwd();
     this.apiKey = config.apiKey ?? getEnvApiKey(provider);
     this.temperature = config.temperature;
+    this.reasoning = config.reasoning ?? "medium";
     this.toolPolicy = config.toolPolicy;
     this.contextTokens = Math.max(
       1,
@@ -547,6 +608,9 @@ export class Agent {
           model: this.modelDef.id,
         });
 
+        // 标记 loop 内部已 emit 过 agent_error，避免 catch 中重复 emit
+        let loopError: string | undefined;
+
         try {
           const ctxInfo = resolveContextWindowInfo({
             contextTokens: this.contextTokens,
@@ -684,6 +748,7 @@ export class Agent {
             streamFn: this.streamFn,
             apiKey: this.apiKey,
             temperature: this.temperature,
+            reasoning: this.reasoning,
             maxTurns: this.maxTurns,
             contextTokens: this.contextTokens,
             getSteeringMessages,
@@ -696,7 +761,6 @@ export class Agent {
           });
 
           // 对应 pi-agent-core: for await (const event of stream) + emit + state update
-          let loopError: string | undefined;
           for await (const event of stream) {
             this.emit(event);
 
@@ -720,11 +784,14 @@ export class Agent {
             memoriesUsed,
           };
         } catch (err) {
-          this.emit({
-            type: "agent_error",
-            runId,
-            error: err instanceof Error ? err.message : String(err),
-          });
+          // loop 内部已 emit 过 agent_error，不重复 emit
+          if (!loopError) {
+            this.emit({
+              type: "agent_error",
+              runId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
           throw err;
         } finally {
           // 对应 OpenClaw: attempt.ts finally → flushPendingToolResults()

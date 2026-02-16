@@ -8,10 +8,37 @@
  * - 工具/生命周期事件通过 switch event.type 处理
  */
 
+import fs from "node:fs";
+import path from "node:path";
 import readline from "node:readline";
 import { Agent } from "./index.js";
 import { resolveSessionKey } from "./session-key.js";
 import { getEnvApiKey } from "@mariozechner/pi-ai";
+
+// ============== .env 加载 ==============
+
+function loadEnvFile(dir: string = process.cwd()): void {
+  const envPath = path.join(dir, ".env");
+  let content: string;
+  try {
+    content = fs.readFileSync(envPath, "utf-8");
+  } catch {
+    return; // .env 不存在，跳过
+  }
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx === -1) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    const value = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
+    if (key && !(key in process.env)) {
+      process.env[key] = value;
+    }
+  }
+}
+
+loadEnvFile();
 
 // ============== 颜色输出 ==============
 
@@ -31,12 +58,16 @@ function color(text: string, c: keyof typeof colors): string {
 
 let unsubscribe: (() => void) | null = null;
 
+// 跟踪上一次 stdout 输出类型，用于在 thinking→text、event→text 之间插入换行
+let lastOutput: "event" | "thinking" | "text" | null = null;
+
 // ============== 主函数 ==============
 
 async function main() {
   const args = process.argv.slice(2);
   const provider = readFlag(args, "--provider") ?? process.env.OPENCLAW_MINI_PROVIDER ?? "anthropic";
-  const model = readFlag(args, "--model");
+  const model = readFlag(args, "--model") ?? process.env.OPENCLAW_MINI_MODEL;
+  const baseUrl = readFlag(args, "--base-url") ?? process.env.OPENCLAW_MINI_BASE_URL;
   const apiKey = readFlag(args, "--api-key") ?? getEnvApiKey(provider);
   if (!apiKey) {
     console.error(`错误: 未找到 ${provider} 的 API Key，请设置对应环境变量或使用 --api-key 参数`);
@@ -62,6 +93,7 @@ async function main() {
     apiKey,
     provider,
     ...(model ? { model } : {}),
+    ...(baseUrl ? { baseUrl } : {}),
     agentId,
     workspaceDir,
   });
@@ -80,23 +112,40 @@ async function main() {
         console.error(color(`[event] run error id=${event.runId} error=${event.error}\n`, "magenta"));
         break;
 
+      // 流式思考输出
+      case "thinking_delta":
+        if (lastOutput === "event") process.stdout.write("\n");
+        process.stdout.write(color(event.delta, "dim"));
+        lastOutput = "thinking";
+        break;
+
       // 流式文本输出
       case "message_delta":
+        if (lastOutput === "thinking" || lastOutput === "event") process.stdout.write("\n");
         process.stdout.write(event.delta);
+        lastOutput = "text";
         break;
       case "message_end":
+        if (lastOutput === "text" || lastOutput === "thinking") process.stdout.write("\n");
         console.error(color(`[event] assistant final chars=${event.text.length}`, "magenta"));
+        lastOutput = "event";
         break;
 
       // 工具事件
       case "tool_execution_start": {
+        if (lastOutput === "text" || lastOutput === "thinking") process.stdout.write("\n");
         const input = safePreview(event.args, 120);
         console.error(color(`[event] tool start ${event.toolName}${input ? ` ${input}` : ""}`, "yellow"));
+        lastOutput = "event";
         break;
       }
-      case "tool_execution_end":
-        console.error(color(`[event] tool end ${event.toolName} ${event.result}`, "yellow"));
+      case "tool_execution_end": {
+        // 工具结果可能含换行（如目录列表），压成单行显示
+        const preview = event.result.replace(/\n/g, " ").slice(0, 120);
+        console.error(color(`[event] tool end ${event.toolName} ${preview}`, "yellow"));
+        lastOutput = "event";
         break;
+      }
       case "tool_skipped":
         console.error(color(`[event] tool skipped ${event.toolName}`, "yellow"));
         break;
@@ -145,6 +194,7 @@ async function main() {
 
       // 运行 Agent（流式文本通过 subscribe 的 message_delta 事件输出）
       process.stdout.write(color("\nAgent: ", "blue"));
+      lastOutput = null;
 
       try {
         const result = await agent.run(sessionKey, trimmed);
@@ -181,19 +231,14 @@ function readFlag(args: string[], name: string): string | undefined {
   return next.trim() || undefined;
 }
 
+const FLAGS_WITH_VALUE = new Set(["--agent", "--model", "--provider", "--api-key", "--base-url"]);
+
 function resolveSessionIdArg(args: string[]): string | undefined {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (arg === "chat") {
-      continue;
-    }
-    if (arg === "--agent") {
-      i += 1;
-      continue;
-    }
-    if (arg.startsWith("--")) {
-      continue;
-    }
+    if (arg === "chat") continue;
+    if (FLAGS_WITH_VALUE.has(arg)) { i += 1; continue; }
+    if (arg.startsWith("--")) continue;
     return arg.trim() || undefined;
   }
   return undefined;

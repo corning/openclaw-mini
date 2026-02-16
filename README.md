@@ -140,13 +140,22 @@ unsubscribe();
 **问题**：Agent 重启后如何恢复对话上下文？
 
 ```typescript
-// session.ts — 追加写入，每行一条消息
-async append(sessionId: string, message: Message): Promise<void> {
-  const filePath = this.getFilePath(sessionId);
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.appendFile(filePath, JSON.stringify(message) + "\n");
+// session.ts — 双写策略: 内存缓存 + 磁盘持久化
+async append(sessionKey: string, message: Message): Promise<void> {
+  // 1. 内存缓存立即更新（读取零 I/O）
+  state.entries.push(entry);
+
+  // 2. 首条 assistant 消息后才落盘（避免空会话写磁盘）
+  if (!state.hasAssistant && message.role === "assistant") {
+    state.hasAssistant = true;
+    await rewriteSessionFile(state); // 首次: 完整写入 header + entries
+  } else if (state.hasAssistant) {
+    await fs.appendFile(filePath, line); // 后续: O(1) 追加
+  }
 }
 ```
+
+JSONL 格式：每行一条 entry，损坏行跳过不影响其他数据。写锁防并发。
 
 ### 3. Context — 加载 + 裁剪 + 摘要压缩
 
@@ -216,24 +225,32 @@ openclaw 用 SQLite-vec 做向量语义搜索 + BM25 关键词搜索，本项目
 ```bash
 cd examples/openclaw-mini
 pnpm install
+```
 
-# Anthropic (默认)
-export ANTHROPIC_API_KEY=sk-xxx
+推荐用 `.env` 文件配置（项目启动时自动加载）：
+
+```env
+OPENCLAW_MINI_PROVIDER=anthropic
+OPENCLAW_MINI_MODEL=anthropic/claude-sonnet-4.5
+OPENCLAW_MINI_BASE_URL=https://your-proxy.com/api/anthropic
+ANTHROPIC_API_KEY=sk-xxx
+```
+
+```bash
 pnpm dev
+```
 
-# OpenAI
-pnpm dev -- --provider openai
-# (需要 OPENAI_API_KEY 环境变量)
+也支持 CLI 参数：
 
-# Google
-pnpm dev -- --provider google
-# (需要 GEMINI_API_KEY 环境变量)
+```bash
+# 直接使用 Anthropic
+ANTHROPIC_API_KEY=sk-xxx pnpm dev
 
-# 指定模型
+# 指定 provider + model
 pnpm dev -- --provider openai --model gpt-4o
 
-# 指定 agentId
-pnpm dev -- --agent my-agent
+# 使用代理
+pnpm dev -- --base-url https://your-proxy.com/api/anthropic
 ```
 
 ## 使用示例
@@ -242,20 +259,26 @@ pnpm dev -- --agent my-agent
 import { Agent } from "openclaw-mini";
 
 const agent = new Agent({
-  provider: "anthropic",        // 支持 22+ 提供商
+  provider: "anthropic",
+  baseUrl: "https://your-proxy.com/api/anthropic", // 可选，代理/自部署端点
   // apiKey 不传则自动从环境变量读取
   agentId: "main",
   workspaceDir: process.cwd(),
-  enableMemory: true,
-  enableContext: true,
-  enableSkills: true,
-  enableHeartbeat: false,
+  reasoning: "medium", // 默认开启 extended thinking (minimal/low/medium/high/xhigh)
 });
 
 // 事件订阅
 const unsubscribe = agent.subscribe((event) => {
-  if (event.type === "message_delta") {
-    process.stdout.write(event.delta);
+  switch (event.type) {
+    case "thinking_delta": // 流式思考
+      process.stdout.write(event.delta);
+      break;
+    case "message_delta": // 流式文本
+      process.stdout.write(event.delta);
+      break;
+    case "tool_execution_start":
+      console.log(`[${event.toolName}]`, event.args);
+      break;
   }
 });
 

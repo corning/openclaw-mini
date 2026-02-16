@@ -47,6 +47,9 @@ export type MiniAgentEvent =
   | { type: "message_delta"; delta: string }
   | { type: "message_end"; message: Message; text: string }
 
+  // 思考（对齐 pi-agent-core: extended thinking 流式输出）
+  | { type: "thinking_delta"; delta: string }
+
   // 工具执行（对齐 pi-agent-core: tool_execution_start / tool_execution_end）
   | { type: "tool_execution_start"; toolCallId: string; toolName: string; args: unknown }
   | { type: "tool_execution_end"; toolCallId: string; toolName: string; result: string; isError: boolean }
@@ -85,13 +88,8 @@ export interface MiniAgentResult {
  */
 export function createMiniAgentStream(): EventStream<MiniAgentEvent, MiniAgentResult> {
   return new EventStream<MiniAgentEvent, MiniAgentResult>(
-    (event) => event.type === "agent_end" || event.type === "agent_error",
-    (event) => {
-      if (event.type === "agent_end") {
-        return { finalText: "", turns: 0, totalToolCalls: 0, messages: event.messages };
-      }
-      // agent_error
-      return { finalText: "", turns: 0, totalToolCalls: 0, messages: [] };
-    },
+    // 不使用 isComplete 自动完成，由 agent-loop 的 stream.end() 显式传入结果
+    () => false,
+    () => ({ finalText: "", turns: 0, totalToolCalls: 0, messages: [] }),
   );
 }
