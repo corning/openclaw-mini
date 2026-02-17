@@ -2,15 +2,16 @@
 /**
  * Mini Agent CLI
  *
- * 事件消费方式:
- * - 使用 agent.subscribe() 订阅类型化事件（对齐 pi-agent-core Agent.subscribe）
- * - 流式文本通过 message_delta 事件输出
- * - 工具/生命周期事件通过 switch event.type 处理
+ * 交互设计:
+ * - 线性滚动输出，不保留固定底部区域
+ * - 输入提示始终跟随在最后一条消息之后
+ * - 历史区仅保留用户/模型/工具事件，不保留输入框装饰
  */
 
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
+import { Writable } from "node:stream";
 import { Agent } from "./index.js";
 import { resolveSessionKey } from "./session-key.js";
 import { getEnvApiKey } from "@mariozechner/pi-ai";
@@ -23,7 +24,7 @@ function loadEnvFile(dir: string = process.cwd()): void {
   try {
     content = fs.readFileSync(envPath, "utf-8");
   } catch {
-    return; // .env 不存在，跳过
+    return;
   }
   for (const line of content.split("\n")) {
     const trimmed = line.trim();
@@ -40,26 +41,124 @@ function loadEnvFile(dir: string = process.cwd()): void {
 
 loadEnvFile();
 
-// ============== 颜色输出 ==============
+// ============== 样式 ==============
 
-const colors = {
+const styles = {
   reset: "\x1b[0m",
+  bold: "\x1b[1m",
   dim: "\x1b[2m",
-  cyan: "\x1b[36m",
+
+  black: "\x1b[30m",
+  white: "\x1b[37m",
   green: "\x1b[32m",
   yellow: "\x1b[33m",
   blue: "\x1b[34m",
   magenta: "\x1b[35m",
-};
+  cyan: "\x1b[36m",
 
-function color(text: string, c: keyof typeof colors): string {
-  return `${colors[c]}${text}${colors.reset}`;
+  bgWhite: "\x1b[47m",
+  bgYellow: "\x1b[43m",
+  bgGreen: "\x1b[42m",
+  bgCyan: "\x1b[46m",
+  bgBlue: "\x1b[44m",
+  bgMagenta: "\x1b[45m",
+} as const;
+
+const badgeStyles = {
+  system: `${styles.black}${styles.bgWhite}`,
+  input: `${styles.black}${styles.bgYellow}`,
+  user: `${styles.black}${styles.bgGreen}`,
+  model: `${styles.black}${styles.bgCyan}`,
+  tool: `${styles.white}${styles.bgBlue}`,
+  think: `${styles.white}${styles.bgMagenta}`,
+} as const;
+
+function color(text: string, c: keyof typeof styles): string {
+  return `${styles[c]}${text}${styles.reset}`;
 }
 
-let unsubscribe: (() => void) | null = null;
+function badge(text: string, style: string): string {
+  return `${style} ${text} ${styles.reset}`;
+}
 
-// 跟踪上一次 stdout 输出类型，用于在 thinking→text、event→text 之间插入换行
-let lastOutput: "event" | "thinking" | "text" | null = null;
+// ============== 输出状态 ==============
+
+let unsubscribe: (() => void) | null = null;
+let outputMode: "idle" | "thinking" | "assistant" = "idle";
+type BlockKind = "system" | "user" | "tool" | "thinking" | "assistant" | "meta";
+let lastBlockKind: BlockKind | null = null;
+
+// 工具调用参数缓存（start 有 args，end 有 result，需关联）
+const pendingToolArgs = new Map<string, unknown>();
+
+function resetTerminal(): void {
+  process.stdout.write("\x1b[?25h");
+}
+
+function closeOutputLine(): void {
+  if (outputMode !== "idle") {
+    process.stdout.write("\n");
+    outputMode = "idle";
+  }
+}
+
+function ensureBlockSpacing(kind: BlockKind): void {
+  if (lastBlockKind && lastBlockKind !== kind) {
+    process.stdout.write("\n");
+  }
+  lastBlockKind = kind;
+}
+
+function beginThinkingLine(): void {
+  if (outputMode !== "thinking") {
+    closeOutputLine();
+    ensureBlockSpacing("thinking");
+    process.stdout.write(`${badge("THINK", badgeStyles.think)} `);
+    outputMode = "thinking";
+  }
+}
+
+function beginAssistantLine(): void {
+  if (outputMode !== "assistant") {
+    closeOutputLine();
+    ensureBlockSpacing("assistant");
+    process.stdout.write(`${badge("MODEL", badgeStyles.model)} `);
+    outputMode = "assistant";
+  }
+}
+
+function printSystemLine(text: string, tone: "info" | "warn" | "error" = "info"): void {
+  closeOutputLine();
+  ensureBlockSpacing("system");
+  let body = text;
+  if (tone === "warn") body = color(text, "yellow");
+  if (tone === "error") body = color(text, "yellow");
+  console.log(`${badge("SYS", badgeStyles.system)} ${body}`);
+}
+
+function printUserLine(text: string): void {
+  closeOutputLine();
+  ensureBlockSpacing("user");
+  console.log(`${badge("USER", badgeStyles.user)} ${text}`);
+}
+
+function printToolLine(text: string, isError = false): void {
+  closeOutputLine();
+  ensureBlockSpacing("tool");
+  const body = isError ? color(text, "yellow") : color(text, "dim");
+  console.log(`${badge("TOOL", badgeStyles.tool)} ${body}`);
+}
+
+function printMetaLine(text: string): void {
+  closeOutputLine();
+  ensureBlockSpacing("meta");
+  console.log(`${color("↳", "dim")} ${text}`);
+}
+
+function clearPromptEchoLine(): void {
+  // 删除 readline 刚回显的 "INPUT ❯ xxx" 行，避免历史污染
+  process.stdout.write("\x1b[1A\x1b[2K\r");
+}
 
 // ============== 主函数 ==============
 
@@ -82,12 +181,12 @@ async function main() {
   const workspaceDir = process.cwd();
   const sessionKey = resolveSessionKey({ agentId, sessionId });
 
-  console.log(color("\n Mini Agent", "cyan"));
-  console.log(color(`Provider: ${provider}${model ? ` (${model})` : ""}`, "dim"));
-  console.log(color(`会话: ${sessionKey}`, "dim"));
-  console.log(color(`Agent: ${agentId}`, "dim"));
-  console.log(color(`目录: ${workspaceDir}`, "dim"));
-  console.log(color("输入 /help 查看命令，Ctrl+C 退出\n", "dim"));
+  // Banner
+  console.log(`${badge("MINI", badgeStyles.system)} ${color("OpenClaw Mini", "bold")}`);
+  console.log(color(`  ${provider}${model ? ` · ${model}` : ""} · ${agentId}`, "dim"));
+  console.log(color(`  ${workspaceDir}`, "dim"));
+  console.log(color("  /help 查看命令 · Ctrl+C 退出", "dim"));
+  console.log();
 
   const agent = new Agent({
     apiKey,
@@ -101,117 +200,110 @@ async function main() {
   // 事件订阅（对齐 pi-agent-core: Agent.subscribe → 类型化事件处理）
   unsubscribe = agent.subscribe((event) => {
     switch (event.type) {
-      // 核心生命周期
       case "agent_start":
-        console.error(color(`\n[event] run start id=${event.runId} model=${event.model}`, "magenta"));
+        printSystemLine(`run ${event.runId.slice(0, 8)} · ${event.model}`);
         break;
       case "agent_end":
-        console.error(color(`[event] run end id=${event.runId}\n`, "magenta"));
         break;
       case "agent_error":
-        console.error(color(`[event] run error id=${event.runId} error=${event.error}\n`, "magenta"));
+        printSystemLine(`error: ${event.error}`, "error");
         break;
 
-      // 流式思考输出
       case "thinking_delta":
-        if (lastOutput === "event") process.stdout.write("\n");
+        beginThinkingLine();
         process.stdout.write(color(event.delta, "dim"));
-        lastOutput = "thinking";
         break;
 
-      // 流式文本输出
       case "message_delta":
-        if (lastOutput === "thinking" || lastOutput === "event") process.stdout.write("\n");
+        beginAssistantLine();
         process.stdout.write(event.delta);
-        lastOutput = "text";
         break;
       case "message_end":
-        if (lastOutput === "text" || lastOutput === "thinking") process.stdout.write("\n");
-        console.error(color(`[event] assistant final chars=${event.text.length}`, "magenta"));
-        lastOutput = "event";
+        closeOutputLine();
         break;
 
-      // 工具事件
       case "tool_execution_start": {
-        if (lastOutput === "text" || lastOutput === "thinking") process.stdout.write("\n");
-        const input = safePreview(event.args, 120);
-        console.error(color(`[event] tool start ${event.toolName}${input ? ` ${input}` : ""}`, "yellow"));
-        lastOutput = "event";
+        pendingToolArgs.set(event.toolCallId, event.args);
         break;
       }
       case "tool_execution_end": {
-        // 工具结果可能含换行（如目录列表），压成单行显示
-        const preview = event.result.replace(/\n/g, " ").slice(0, 120);
-        console.error(color(`[event] tool end ${event.toolName} ${preview}`, "yellow"));
-        lastOutput = "event";
+        const toolArgs = pendingToolArgs.get(event.toolCallId);
+        pendingToolArgs.delete(event.toolCallId);
+        const label = formatToolCompact(event.toolName, toolArgs);
+        const symbol = event.isError ? "✗" : "•";
+        printToolLine(`${symbol} ${label}`, event.isError);
         break;
       }
       case "tool_skipped":
-        console.error(color(`[event] tool skipped ${event.toolName}`, "yellow"));
+        printToolLine(`⊘ ${event.toolName} (skipped)`);
         break;
 
-      // Compaction
       case "compaction":
-        console.error(
-          color(
-            `[event] compaction summary_chars=${event.summaryChars} dropped_messages=${event.droppedMessages}`,
-            "magenta",
-          ),
-        );
+        printSystemLine(`compaction: dropped ${event.droppedMessages} messages`);
         break;
 
-      // 子代理
       case "subagent_summary": {
-        const label = event.label ? ` (${event.label})` : "";
-        console.error(color(`\n[subagent${label}] ${event.summary}\n`, "cyan"));
+        const l = event.label ? ` (${event.label})` : "";
+        printSystemLine(`subagent${l}: ${event.summary.slice(0, 120)}`);
         break;
       }
       case "subagent_error":
-        console.error(color(`\n[subagent] error: ${event.error}\n`, "yellow"));
+        printSystemLine(`subagent error: ${event.error}`, "error");
         break;
     }
   });
 
+  // 过滤 readline 的 clearScreenDown（\x1b[J），避免意外擦屏
+  const rlOutput = new Writable({
+    write(chunk, _encoding, callback) {
+      const text = typeof chunk === "string" ? chunk : chunk.toString();
+      process.stdout.write(text.replace(/\x1b\[0?J/g, ""), callback);
+    },
+  });
+
   const rl = readline.createInterface({
     input: process.stdin,
-    output: process.stdout,
+    output: rlOutput,
   });
 
   const prompt = () => {
-    rl.question(color("你: ", "green"), async (input) => {
+    rl.question(`${badge("INPUT", badgeStyles.input)} ${color("❯", "green")} `, async (input) => {
+      clearPromptEchoLine();
+
       const trimmed = input.trim();
       if (!trimmed) {
         prompt();
         return;
       }
 
+      // 仅把“真正发送的内容”写入历史显示
+      printUserLine(trimmed);
+
       // 命令处理
       if (trimmed.startsWith("/")) {
         await handleCommand(trimmed, agent, sessionKey);
+        console.log();
         prompt();
         return;
       }
 
-      // 运行 Agent（流式文本通过 subscribe 的 message_delta 事件输出）
-      process.stdout.write(color("\nAgent: ", "blue"));
-      lastOutput = null;
+      // Agent 执行
+      outputMode = "idle";
 
       try {
         const result = await agent.run(sessionKey, trimmed);
 
-        const summaryParts = [
-          `id=${result.runId ?? "unknown"}`,
-          `turns=${result.turns}`,
-          `tools=${result.toolCalls}`,
-          typeof result.memoriesUsed === "number" ? `memories=${result.memoriesUsed}` : "",
-          `chars=${result.text.length}`,
-        ].filter(Boolean);
-        console.log(color(`\n\n  [${summaryParts.join(", ")}]`, "dim"));
+        const parts = [
+          `${color(String(result.turns), "cyan")} turns`,
+          `${color(String(result.toolCalls), "yellow")} tools`,
+          `${color(String(result.memoriesUsed ?? 0), "magenta")} memories`,
+          `${color(String(result.text.length), "green")} chars`,
+        ];
+        printMetaLine(parts.join(color(" · ", "dim")));
       } catch (err) {
-        console.error(color(`\n错误: ${(err as Error).message}`, "yellow"));
+        closeOutputLine();
+        printSystemLine((err as Error).message, "error");
       }
-
-      console.log();
       prompt();
     });
   };
@@ -219,15 +311,13 @@ async function main() {
   prompt();
 }
 
+// ============== 工具函数 ==============
+
 function readFlag(args: string[], name: string): string | undefined {
   const idx = args.findIndex((arg) => arg === name);
-  if (idx === -1) {
-    return undefined;
-  }
+  if (idx === -1) return undefined;
   const next = args[idx + 1];
-  if (!next || next.startsWith("--")) {
-    return undefined;
-  }
+  if (!next || next.startsWith("--")) return undefined;
   return next.trim() || undefined;
 }
 
@@ -244,16 +334,28 @@ function resolveSessionIdArg(args: string[]): string | undefined {
   return undefined;
 }
 
-function safePreview(input: unknown, max = 120): string {
-  try {
-    const text = JSON.stringify(input);
-    if (!text) {
-      return "";
-    }
-    return text.length > max ? `${text.slice(0, max)}...` : text;
-  } catch {
-    return "";
+/** 提取工具调用的关键参数，生成紧凑摘要 */
+function formatToolCompact(name: string, args: unknown): string {
+  const a = (args ?? {}) as Record<string, string>;
+  switch (name) {
+    case "read": return `read(${shortPath(a.file_path)})`;
+    case "write": return `write(${shortPath(a.file_path)})`;
+    case "edit": return `edit(${shortPath(a.file_path)})`;
+    case "list": return `list(${a.path || "."})`;
+    case "exec": return `exec(\`${String(a.command || "").slice(0, 50)}\`)`;
+    case "grep": return `grep("${a.pattern || ""}"${a.path ? `, ${a.path}` : ""})`;
+    case "memory_search": return `memory_search("${(a.query || "").slice(0, 30)}")`;
+    case "memory_get": return `memory_get(${a.id || ""})`;
+    case "memory_save": return `memory_save(${(a.content || "").slice(0, 30)}...)`;
+    case "subagent": return `subagent("${(a.task || "").slice(0, 40)}")`;
+    default: return name;
   }
+}
+
+function shortPath(p: string | undefined): string {
+  if (!p) return "";
+  const parts = p.split("/");
+  return parts.length > 2 ? `.../${parts.slice(-2).join("/")}` : p;
 }
 
 async function handleCommand(cmd: string, agent: Agent, sessionKey: string) {
@@ -261,14 +363,7 @@ async function handleCommand(cmd: string, agent: Agent, sessionKey: string) {
 
   switch (command) {
     case "help":
-      console.log(`
-命令:
-  /help     显示帮助
-  /reset    重置当前会话
-  /history  显示会话历史
-  /sessions 列出所有会话
-  /quit     退出
-`);
+      console.log(`命令:\n  /help     显示帮助\n  /reset    重置当前会话\n  /history  显示会话历史\n  /sessions 列出所有会话\n  /quit     退出`);
       break;
 
     case "reset":
@@ -308,6 +403,7 @@ async function handleCommand(cmd: string, agent: Agent, sessionKey: string) {
 
     case "quit":
     case "exit":
+      resetTerminal();
       process.exit(0);
 
     default:
@@ -317,12 +413,16 @@ async function handleCommand(cmd: string, agent: Agent, sessionKey: string) {
 
 // 处理 Ctrl+C
 process.on("SIGINT", () => {
-  console.log(color("\n\n再见! 👋", "cyan"));
+  closeOutputLine();
+  resetTerminal();
+  console.log(color("\nBye!", "dim"));
   unsubscribe?.();
   process.exit(0);
 });
 
 main().catch((err) => {
+  closeOutputLine();
+  resetTerminal();
   console.error("启动失败:", err);
   process.exit(1);
 });
