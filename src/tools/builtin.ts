@@ -620,16 +620,21 @@ export const sessionsSpawnTool: Tool<{
   },
 };
 
+// ============== 渠道工具 ==============
+
+import { channelTools } from "./channel.js";
+
 // ============== 导出 ==============
 
 /**
  * 所有内置工具
  *
- * 这 10 个工具覆盖了 Agent 的核心能力:
+ * 这 13 个工具覆盖了 Agent 的核心能力:
  * - 感知: read, list, grep
  * - 行动: write, edit, exec
  * - 记忆: memory_search, memory_get, memory_save
  * - 编排: sessions_spawn
+ * - 渠道: channel_send, channel_status, channel_broadcast
  *
  * OpenClaw 有 50+ 工具，包括:
  * - 浏览器自动化 (Puppeteer)
@@ -638,7 +643,7 @@ export const sessionsSpawnTool: Tool<{
  * - API 调用
  * - 等等...
  *
- * 但这 10 个是最基础的，理解了这些就理解了工具系统的本质。
+ * 但这 13 个是最基础的，理解了这些就理解了工具系统的本质。
  */
 export const builtinTools: Tool[] = [
   readTool,
@@ -651,4 +656,5 @@ export const builtinTools: Tool[] = [
   memoryGetTool,
   memorySaveTool,
   sessionsSpawnTool,
+  ...channelTools,
 ];

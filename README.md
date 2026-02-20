@@ -42,6 +42,11 @@ OpenClaw 是一个超 43w 行的复杂 Agent 系统，本项目从中提炼出�
 │                                                              │
 │  Memory (长期记忆) · Skills (技能系统) · Heartbeat (主动唤醒) │
 ├─────────────────────────────────────────────────────────────┤
+│                    [渠道层] Channels                          │
+│  多渠道机器人接入，支持飞书、Webhook 等                      │
+│                                                              │
+│  Feishu (飞书) · Webhook · Example · Channel Manager        │
+├─────────────────────────────────────────────────────────────┤
 │                      [核心层] Core                            │
 │  任何 Agent 都需要的基础能力 ← 优先阅读                      │
 │                                                              │
@@ -72,6 +77,15 @@ OpenClaw 是一个超 43w 行的复杂 Agent 系统，本项目从中提炼出�
 | **Memory** | `memory.ts` | 长期记忆 (关键词检索 + 时间衰减) | `memory/manager.ts` |
 | **Skills** | `skills.ts` | SKILL.md frontmatter + 触发词匹配 | `agents/skills/` |
 | **Heartbeat** | `heartbeat.ts` | 两层架构: wake 请求合并 + runner 调度 | `heartbeat-runner.ts` + `heartbeat-wake.ts` |
+
+### 渠道层 — 机器人接入
+
+| 模块 | 文件 | 核心职责 | 支持渠道 |
+|------|------|----------|----------|
+| **Channels** | `channels/*.ts` | 多渠道机器人接入与管理 | 飞书、Webhook、示例 |
+| **Feishu** | `channels/feishu.ts` | 飞书机器人集成 | 企业自建应用 |
+| **Webhook** | `channels/webhook.ts` | 通用 Webhook 支持 | HTTP/HTTPS |
+| **Channel Tools** | `tools/channel.ts` | 渠道相关工具 | channel_send, channel_status, channel_broadcast |
 
 ### 工程层 — 可跳过
 
@@ -255,6 +269,8 @@ pnpm dev -- --base-url https://your-proxy.com/api/anthropic
 
 ## 使用示例
 
+### 基础示例
+
 ```typescript
 import { Agent } from "openclaw-mini";
 
@@ -287,6 +303,49 @@ console.log(`${result.turns} 轮, ${result.toolCalls} 次工具调用`);
 
 unsubscribe();
 ```
+
+### 飞书渠道示例
+
+```typescript
+import { Agent, createChannelManager, FeishuChannel } from "openclaw-mini";
+
+// 创建飞书渠道
+const feishuChannel = new FeishuChannel("feishu-bot", {
+  appId: process.env.FEISHU_APP_ID!,
+  appSecret: process.env.FEISHU_APP_SECRET!,
+});
+
+// 创建渠道管理器
+const channelManager = createChannelManager();
+channelManager.registerChannel(feishuChannel);
+
+// 初始化并连接
+await feishuChannel.initialize();
+await feishuChannel.connect();
+
+// 创建 Agent
+const agent = new Agent({
+  apiKey: process.env.ANTHROPIC_API_KEY!,
+  workspaceDir: process.cwd(),
+});
+
+// 设置渠道管理器到 Agent 上下文
+const sessionId = "feishu-session";
+const context = await agent.getSessionContext(sessionId);
+context.metadata = {
+  ...context.metadata,
+  channelManager,
+};
+
+// 使用渠道工具
+const result = await agent.run(sessionId, "发送消息到飞书，内容：'你好，飞书！'，会话ID：oc_123456");
+console.log(`消息发送结果: ${result.toolCalls} 次工具调用`);
+```
+
+更多示例请查看 `examples/` 目录：
+- `basic.ts` - 基础使用
+- `feishu-channel.ts` - 飞书渠道完整示例
+- `custom-tools.ts` - 自定义工具示例
 
 ## 学习路径建议
 

@@ -145,3 +145,26 @@ export {
 
 // Tool Policy — 工具访问控制 (allow/deny/none 三级编译)
 export { type ToolPolicy, filterToolsByPolicy } from "./tool-policy.js";
+
+// =============================================
+// [渠道层] Channels - 多渠道机器人接入
+// =============================================
+
+// Channels — 多渠道机器人接入 (飞书、Webhook、示例等)
+export {
+  ChannelManager,
+  createChannelManager,
+  createChannelFromConfig,
+  loadChannelsFromConfig,
+  FeishuChannel,
+  type FeishuConfig,
+  WebhookChannel,
+  type WebhookConfig,
+  ExampleChannel,
+  type ExampleConfig,
+  type Channel,
+  type ChannelMessage,
+  type ChannelResponse,
+  type ChannelConfig,
+  type ChannelEvent,
+} from "./channels/index.js";
