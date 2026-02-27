@@ -270,19 +270,21 @@ export class Agent {
       if (!api) {
         throw new Error(`未知 provider: ${provider}，请指定 modelDef。`);
       }
+      const baseUrl = config.baseUrl ?? ""
       modelDef = {
         id: modelId,
         name: modelId,
         api,
         provider,
-        baseUrl: config.baseUrl ?? "",
+        baseUrl: baseUrl,
         reasoning: true,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 200_000,
         maxTokens: 8192,
         compat: {
-          supportsDeveloperRole: false
+          // 阿里模型不支持此默认参数
+          supportsDeveloperRole: !(baseUrl.indexOf("dashscope") > -1)
         }
       };
     }

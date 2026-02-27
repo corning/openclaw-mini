@@ -12,6 +12,8 @@
  *    - FEISHU_VERIFICATION_TOKEN (可选)
  */
 
+import "dotenv/config";
+
 import { Agent, createChannelManager, FeishuChannel } from "../src/index.js";
 
 async function main() {
@@ -94,7 +96,7 @@ async function main() {
   // 示例 2: 发送测试消息到飞书
   console.log("\n--- 示例 2: 发送测试消息到飞书 ---");
   console.log("注意：需要提供飞书用户或群聊的 conversation_id");
-  
+
   const conversationId = process.env.FEISHU_TEST_CONVERSATION_ID;
   if (conversationId) {
     const result2 = await agent.run(sessionId, `发送消息到飞书，内容："这是来自 Mini Agent 的测试消息，时间：${new Date().toLocaleString()}"，会话ID：${conversationId}`);
@@ -111,7 +113,7 @@ async function main() {
   // 示例 4: 处理飞书消息（模拟）
   console.log("\n--- 示例 4: 模拟处理飞书消息 ---");
   console.log("模拟飞书 webhook 事件...");
-  
+
   // 模拟一个飞书消息事件
   const mockFeishuEvent = {
     event: {

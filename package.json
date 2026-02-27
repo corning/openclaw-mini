@@ -12,10 +12,12 @@
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
     "chat": "tsx src/cli.ts chat",
-    "example": "tsx examples/basic.ts"
+    "example": "tsx examples/basic.ts",
+    "feishu": "tsx examples/feishu-channel.ts"
   },
   "dependencies": {
-    "@mariozechner/pi-ai": "^0.55.1"
+    "@mariozechner/pi-ai": "^0.55.1",
+    "dotenv": "^17.3.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
