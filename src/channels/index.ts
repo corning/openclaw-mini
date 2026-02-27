@@ -3,12 +3,18 @@
  * 提供多渠道机器人接入能力
  */
 
-export type { 
-  Channel, 
-  ChannelMessage, 
-  ChannelResponse, 
-  ChannelConfig, 
-  ChannelEvent 
+import { ExampleChannel } from "./example.js";
+import { FeishuChannel } from "./feishu.js";
+import { ChannelManager } from "./manager.js";
+import { Channel } from "./types.js";
+import { WebhookChannel } from "./webhook.js";
+
+export type {
+  Channel,
+  ChannelMessage,
+  ChannelResponse,
+  ChannelConfig,
+  ChannelEvent
 } from "./types.js";
 
 export { ChannelManager } from "./manager.js";
@@ -34,13 +40,13 @@ export function createChannelFromConfig(
   switch (type.toLowerCase()) {
     case 'feishu':
       return new FeishuChannel(id, config);
-    
+
     case 'webhook':
       return new WebhookChannel(id, config);
-    
+
     case 'example':
       return new ExampleChannel(id, config);
-    
+
     default:
       throw new Error(`Unknown channel type: ${type}`);
   }
@@ -58,7 +64,7 @@ export async function loadChannelsFromConfig(
   }>
 ): Promise<ChannelManager> {
   const manager = createChannelManager();
-  
+
   for (const channelConfig of configs) {
     try {
       const channel = createChannelFromConfig(
@@ -66,9 +72,9 @@ export async function loadChannelsFromConfig(
         channelConfig.id,
         channelConfig.config
       );
-      
+
       manager.registerChannel(channel);
-      
+
       // 如果启用，自动连接
       if (channelConfig.enabled !== false) {
         await channel.initialize();
@@ -78,6 +84,6 @@ export async function loadChannelsFromConfig(
       console.error(`Failed to load channel ${channelConfig.type}:${channelConfig.id}:`, error);
     }
   }
-  
+
   return manager;
 }
