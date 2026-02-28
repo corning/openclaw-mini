@@ -1,11 +1,20 @@
 /**
- * 飞书渠道实现
- * 基于飞书开放平台机器人API
+ * 飞书渠道实现 (增强版)
+ * 基于飞书开放平台机器人API，支持多账户、Webhook、WebSocket连接
+ * 参考 openclaw/extensions/feishu 实现
  */
 
 import type { Channel, ChannelMessage, ChannelResponse, ChannelEvent } from "./types.js";
 
-export interface FeishuConfig {
+export type FeishuDomain = "feishu" | "lark" | string;
+
+export interface FeishuAccountConfig {
+  /** 账户ID */
+  accountId: string;
+  /** 账户名称 */
+  name?: string;
+  /** 是否启用 */
+  enabled: boolean;
   /** 飞书应用 App ID */
   appId: string;
   /** 飞书应用 App Secret */
@@ -14,11 +23,44 @@ export interface FeishuConfig {
   encryptKey?: string;
   /** 验证令牌（可选） */
   verificationToken?: string;
-  /** Webhook 地址（可选，如果使用webhook模式） */
-  webhookUrl?: string;
-  /** 消息接收端点（可选，用于配置飞书事件订阅） */
-  endpoint?: string;
+  /** 域名：feishu 或 lark */
+  domain?: FeishuDomain;
+  /** 连接模式：webhook 或 websocket */
+  connectionMode?: "webhook" | "websocket";
+  /** Webhook 路径 */
+  webhookPath?: string;
+  /** Webhook 主机 */
+  webhookHost?: string;
+  /** Webhook 端口 */
+  webhookPort?: number;
+  /** 是否需要提及机器人 */
+  requireMention?: boolean;
+  /** 私聊策略 */
+  dmPolicy?: "open" | "pairing" | "allowlist";
+  /** 群聊策略 */
+  groupPolicy?: "open" | "allowlist" | "disabled";
 }
+
+export interface FeishuConfig {
+  /** 默认账户配置 */
+  defaultAccount?: FeishuAccountConfig;
+  /** 多账户配置 */
+  accounts?: Record<string, FeishuAccountConfig>;
+  /** 是否启用所有账户 */
+  enabled?: boolean;
+  /** 全局配置 */
+  domain?: FeishuDomain;
+  connectionMode?: "webhook" | "websocket";
+  requireMention?: boolean;
+  dmPolicy?: "open" | "pairing" | "allowlist";
+  groupPolicy?: "open" | "allowlist" | "disabled";
+}
+
+// 飞书SDK
+import * as Lark from "@larksuiteoapi/node-sdk";
+
+// 客户端缓存
+const clientCache = new Map<string, Lark.Client>();
 
 export class FeishuChannel implements Channel {
   readonly type = "feishu";
@@ -27,8 +69,10 @@ export class FeishuChannel implements Channel {
   private connectedState = false;
   private messageCallbacks: Array<(message: ChannelMessage) => void> = [];
   private eventCallbacks: Array<(event: ChannelEvent) => void> = [];
-  private accessToken?: string;
-  private tokenExpiresAt?: Date;
+  private client?: Lark.Client;
+  private wsClient?: Lark.WSClient;
+  private eventDispatcher?: Lark.EventDispatcher;
+  private currentAccount?: FeishuAccountConfig;
 
   constructor(id: string, config: FeishuConfig) {
     this.id = id;
@@ -39,19 +83,126 @@ export class FeishuChannel implements Channel {
     return this.connectedState;
   }
 
+  /**
+   * 获取当前活动的账户配置
+   */
+  private getActiveAccount(): FeishuAccountConfig {
+    if (this.currentAccount) {
+      return this.currentAccount;
+    }
+
+    // 优先使用默认账户
+    if (this.config.defaultAccount) {
+      this.currentAccount = this.config.defaultAccount;
+      return this.currentAccount;
+    }
+
+    // 如果没有默认账户，从accounts中获取第一个启用的账户
+    if (this.config.accounts) {
+      const enabledAccounts = Object.values(this.config.accounts).filter(account => account.enabled);
+      if (enabledAccounts.length > 0) {
+        this.currentAccount = enabledAccounts[0];
+        return this.currentAccount;
+      }
+    }
+
+    throw new Error('No active Feishu account configured');
+  }
+
+  /**
+   * 切换账户
+   */
+  async switchAccount(accountId: string): Promise<void> {
+    if (!this.config.accounts || !this.config.accounts[accountId]) {
+      throw new Error(`Feishu account ${accountId} not found`);
+    }
+
+    const account = this.config.accounts[accountId];
+    if (!account.enabled) {
+      throw new Error(`Feishu account ${accountId} is not enabled`);
+    }
+
+    // 如果已连接，先断开
+    if (this.connectedState) {
+      await this.disconnect();
+    }
+
+    this.currentAccount = account;
+    console.log(`[FeishuChannel:${this.id}] Switched to account: ${accountId}`);
+  }
+
+  /**
+   * 创建飞书客户端
+   */
+  private createFeishuClient(account: FeishuAccountConfig): Lark.Client {
+    const cacheKey = `${this.id}:${account.accountId}`;
+    
+    // 检查缓存
+    const cached = clientCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    // 创建新客户端
+    const domain = account.domain || this.config.domain || 'feishu';
+    let resolvedDomain: string | Lark.Domain;
+    
+    if (domain === 'lark') {
+      resolvedDomain = Lark.Domain.Lark;
+    } else if (domain === 'feishu') {
+      resolvedDomain = Lark.Domain.Feishu;
+    } else {
+      resolvedDomain = domain.replace(/\/+$/, '');
+    }
+
+    const client = new Lark.Client({
+      appId: account.appId,
+      appSecret: account.appSecret,
+      appType: Lark.AppType.SelfBuild,
+      domain: resolvedDomain,
+      loggerLevel: Lark.LoggerLevel.info,
+    });
+
+    // 缓存客户端
+    clientCache.set(cacheKey, client);
+    return client;
+  }
+
   async initialize(): Promise<void> {
     console.log(`[FeishuChannel:${this.id}] Initializing...`);
     
+    // 获取活动账户
+    const account = this.getActiveAccount();
+    
     // 验证配置
-    if (!this.config.appId || !this.config.appSecret) {
+    if (!account.appId || !account.appSecret) {
       throw new Error('Feishu appId and appSecret are required');
     }
 
-    // 初始化连接
-    await this.refreshAccessToken();
+    // 创建客户端
+    this.client = this.createFeishuClient(account);
     
-    console.log(`[FeishuChannel:${this.id}] Initialized`);
-    this.emitEvent({ type: 'initialized', data: { id: this.id }, timestamp: new Date() });
+    // 如果是websocket模式，准备创建websocket客户端
+    const connectionMode = account.connectionMode || this.config.connectionMode || 'webhook';
+    if (connectionMode === 'websocket') {
+      this.wsClient = new Lark.WSClient({
+        appId: account.appId,
+        appSecret: account.appSecret,
+        domain: account.domain === 'lark' ? Lark.Domain.Lark : Lark.Domain.Feishu,
+        loggerLevel: Lark.LoggerLevel.info,
+      });
+    }
+
+    // 创建事件分发器
+    if (account.encryptKey || account.verificationToken) {
+      this.eventDispatcher = new Lark.EventDispatcher({
+        encryptKey: account.encryptKey,
+        verificationToken: account.verificationToken,
+      });
+    }
+
+    console.log(`[FeishuChannel:${this.id}] Initialized with account: ${account.accountId}`);
+    this.emitEvent({ type: 'initialized', data: { id: this.id, accountId: account.accountId }, timestamp: new Date() });
   }
 
   async connect(): Promise<void> {
@@ -62,12 +213,43 @@ export class FeishuChannel implements Channel {
     console.log(`[FeishuChannel:${this.id}] Connecting...`);
     
     try {
-      // 确保有有效的访问令牌
-      await this.ensureValidToken();
-      
-      this.connectedState = true;
-      console.log(`[FeishuChannel:${this.id}] Connected`);
-      this.emitEvent({ type: 'connected', data: { id: this.id }, timestamp: new Date() });
+      const account = this.getActiveAccount();
+      const connectionMode = account.connectionMode || this.config.connectionMode || 'webhook';
+
+      if (connectionMode === 'websocket' && this.wsClient) {
+        // WebSocket连接
+        await new Promise<void>((resolve, reject) => {
+          if (!this.wsClient) {
+            reject(new Error('WebSocket client not initialized'));
+            return;
+          }
+
+          this.wsClient.start();
+          
+          // 监听事件
+          this.wsClient.on('ready', () => {
+            console.log(`[FeishuChannel:${this.id}] WebSocket connected`);
+            this.connectedState = true;
+            this.emitEvent({ type: 'connected', data: { id: this.id, mode: 'websocket' }, timestamp: new Date() });
+            resolve();
+          });
+
+          this.wsClient.on('error', (error) => {
+            console.error(`[FeishuChannel:${this.id}] WebSocket error:`, error);
+            reject(error);
+          });
+
+          this.wsClient.on('message', async (data: any) => {
+            await this.handleFeishuEvent(data);
+          });
+        });
+      } else {
+        // Webhook模式，只需验证令牌有效性
+        await this.ensureValidToken();
+        this.connectedState = true;
+        console.log(`[FeishuChannel:${this.id}] Connected in webhook mode`);
+        this.emitEvent({ type: 'connected', data: { id: this.id, mode: 'webhook' }, timestamp: new Date() });
+      }
     } catch (error) {
       console.error(`[FeishuChannel:${this.id}] Connection failed:`, error);
       this.emitEvent({ 
@@ -85,11 +267,13 @@ export class FeishuChannel implements Channel {
     }
 
     console.log(`[FeishuChannel:${this.id}] Disconnecting...`);
-    this.connectedState = false;
     
-    // 清理资源
-    this.accessToken = undefined;
-    this.tokenExpiresAt = undefined;
+    // 关闭WebSocket连接
+    if (this.wsClient) {
+      this.wsClient.stop();
+    }
+    
+    this.connectedState = false;
     
     console.log(`[FeishuChannel:${this.id}] Disconnected`);
     this.emitEvent({ type: 'disconnected', data: { id: this.id }, timestamp: new Date() });
@@ -131,39 +315,28 @@ export class FeishuChannel implements Channel {
     this.eventCallbacks.push(callback);
   }
 
-  getInfo(): Record<string, any> {
-    return {
-      type: this.type,
-      id: this.id,
-      connected: this.connectedState,
-      config: {
-        appId: this.config.appId,
-        hasEncryptKey: !!this.config.encryptKey,
-        hasWebhook: !!this.config.webhookUrl,
-      },
-      tokenValid: !!this.accessToken && (!this.tokenExpiresAt || this.tokenExpiresAt > new Date()),
-    };
-  }
-
   /**
    * 处理飞书webhook事件
-   * 这个方法应该由外部webhook处理器调用
    */
   async handleWebhookEvent(event: any): Promise<void> {
     try {
-      // 验证事件签名（如果配置了加密密钥）
-      if (this.config.encryptKey && !this.verifySignature(event)) {
-        console.warn(`[FeishuChannel:${this.id}] Invalid signature`);
-        return;
+      const account = this.getActiveAccount();
+      
+      // 如果有事件分发器，使用它验证和解析事件
+      if (this.eventDispatcher) {
+        const verified = this.eventDispatcher.verifySignature(event);
+        if (!verified) {
+          console.warn(`[FeishuChannel:${this.id}] Invalid signature`);
+          return;
+        }
       }
 
       // 解析飞书事件
-      const message = this.parseFeishuEvent(event);
+      const message = await this.parseFeishuEvent(event);
       if (message) {
         this.emitMessage(message);
       }
 
-      // 发送其他类型的事件
       this.emitEvent({
         type: 'webhook_received',
         data: event,
@@ -179,114 +352,143 @@ export class FeishuChannel implements Channel {
     }
   }
 
+  getInfo(): Record<string, any> {
+    const account = this.getActiveAccount();
+    const connectionMode = account.connectionMode || this.config.connectionMode || 'webhook';
+    
+    return {
+      type: this.type,
+      id: this.id,
+      connected: this.connectedState,
+      accountId: account.accountId,
+      connectionMode,
+      config: {
+        appId: account.appId,
+        domain: account.domain,
+        requireMention: account.requireMention,
+        hasEncryptKey: !!account.encryptKey,
+        hasVerificationToken: !!account.verificationToken,
+      },
+    };
+  }
+
   /**
-   * 刷新访问令牌
+   * 获取账户列表
    */
-  private async refreshAccessToken(): Promise<void> {
-    try {
-      const response = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          app_id: this.config.appId,
-          app_secret: this.config.appSecret,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`Failed to get access token: ${response.statusText}`);
-      }
-
-      const data = await response.json() as { code: number; msg: string; tenant_access_token?: string; expire?: number };
-      
-      if (data.code !== 0) {
-        throw new Error(`Feishu API error: ${data.msg}`);
-      }
-
-      this.accessToken = data.tenant_access_token;
-      // 设置过期时间（提前5分钟刷新）
-      const expiresIn = data.expire || 7200; // 默认2小时
-      this.tokenExpiresAt = new Date(Date.now() + (expiresIn - 300) * 1000);
-      
-      console.log(`[FeishuChannel:${this.id}] Access token refreshed`);
-    } catch (error) {
-      console.error(`[FeishuChannel:${this.id}] Failed to refresh access token:`, error);
-      throw error;
+  getAccounts(): FeishuAccountConfig[] {
+    const accounts: FeishuAccountConfig[] = [];
+    
+    if (this.config.defaultAccount) {
+      accounts.push(this.config.defaultAccount);
     }
+    
+    if (this.config.accounts) {
+      accounts.push(...Object.values(this.config.accounts));
+    }
+    
+    return accounts;
   }
 
   /**
    * 确保访问令牌有效
    */
   private async ensureValidToken(): Promise<void> {
-    const now = new Date();
-    if (!this.accessToken || !this.tokenExpiresAt || this.tokenExpiresAt <= now) {
-      await this.refreshAccessToken();
+    if (!this.client) {
+      throw new Error('Feishu client not initialized');
     }
+
+    // 飞书SDK会自动处理令牌刷新
+    // 这里只需确保客户端已初始化
+    return;
   }
 
   /**
    * 发送消息到飞书
    */
   private async sendToFeishu(message: ChannelMessage): Promise<any> {
-    await this.ensureValidToken();
+    if (!this.client) {
+      throw new Error('Feishu client not initialized');
+    }
 
-    // 构建飞书消息格式
-    const feishuMessage = this.buildFeishuMessage(message);
+    const account = this.getActiveAccount();
+    const receiveId = message.conversationId || message.userId;
+    const msgType = message.messageType === 'markdown' ? 'interactive' : 'text';
     
-    // 发送到飞书API
-    const response = await fetch('https://open.feishu.cn/open-apis/im/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.accessToken}`,
+    // 构建消息内容
+    let content: string;
+    if (msgType === 'interactive') {
+      // 卡片消息
+      content = JSON.stringify({
+        config: { wide_screen_mode: true },
+        header: {
+          title: {
+            tag: "plain_text",
+            content: "Agent Message"
+          }
+        },
+        elements: [
+          {
+            tag: "markdown",
+            content: message.content
+          }
+        ]
+      });
+    } else {
+      // 文本消息
+      content = JSON.stringify({ text: message.content });
+    }
+
+    // 发送消息
+    const result = await this.client.im.message.create({
+      params: { receive_id_type: this.guessIdType(receiveId) },
+      data: {
+        receive_id: receiveId,
+        msg_type: msgType,
+        content: content,
       },
-      body: JSON.stringify({
-        receive_id: message.conversationId || message.userId,
-        msg_type: 'text',
-        content: JSON.stringify(feishuMessage),
-      }),
     });
 
-    if (!response.ok) {
-      throw new Error(`Feishu API error: ${response.statusText}`);
+    if (result.code !== 0) {
+      throw new Error(`Feishu API error: ${result.msg}`);
     }
 
-    const data = await response.json() as { code: number; msg: string; data?: any };
-    
-    if (data.code !== 0) {
-      throw new Error(`Feishu API error: ${data.msg}`);
-    }
-
-    return data.data;
+    return result.data;
   }
 
   /**
-   * 构建飞书消息格式
+   * 猜测ID类型
    */
-  private buildFeishuMessage(message: ChannelMessage): any {
-    // 基础文本消息
-    if (message.messageType === 'text') {
-      return {
-        text: message.content,
-      };
+  private guessIdType(id: string): "open_id" | "user_id" | "chat_id" | "union_id" {
+    if (id.startsWith('ou_')) {
+      return 'open_id';
+    } else if (id.startsWith('u_')) {
+      return 'user_id';
+    } else if (id.startsWith('oc_')) {
+      return 'chat_id';
+    } else {
+      // 默认尝试open_id
+      return 'open_id';
     }
-    
-    // 其他消息类型可以在这里扩展
-    // 例如：富文本、卡片消息等
-    
-    // 默认返回文本消息
-    return {
-      text: message.content,
-    };
+  }
+
+  /**
+   * 处理飞书事件
+   */
+  private async handleFeishuEvent(data: any): Promise<void> {
+    try {
+      const message = await this.parseFeishuEvent(data);
+      if (message) {
+        this.emitMessage(message);
+      }
+    } catch (error) {
+      console.error(`[FeishuChannel:${this.id}] Error handling Feishu event:`, error);
+    }
   }
 
   /**
    * 解析飞书事件为ChannelMessage
    */
-  private parseFeishuEvent(event: any): ChannelMessage | null {
+  private async parseFeishuEvent(event: any): Promise<ChannelMessage | null> {
     // 飞书事件结构参考：https://open.feishu.cn/document/server-docs/event-subscription-guide/event-subscription-concepts
     if (!event || !event.event) {
       return null;
@@ -297,20 +499,54 @@ export class FeishuChannel implements Channel {
     // 处理消息事件
     if (feishuEvent.type === 'message' && feishuEvent.message) {
       const message = feishuEvent.message;
+      const account = this.getActiveAccount();
       
+      // 提取消息内容
+      let content = '';
+      if (message.message_type === 'text') {
+        const textContent = JSON.parse(message.content || '{}');
+        content = textContent.text || '';
+      } else if (message.message_type === 'post') {
+        const postContent = JSON.parse(message.content || '{}');
+        // 简化处理富文本消息
+        content = '[富文本消息]';
+      } else if (message.message_type === 'image') {
+        content = '[图片消息]';
+      } else {
+        content = `[${message.message_type}消息]`;
+      }
+
+      // 检查是否需要提及机器人
+      const requireMention = account.requireMention || this.config.requireMention;
+      let mentionedBot = false;
+      
+      if (requireMention && message.mentions) {
+        // 检查是否提及了机器人
+        mentionedBot = message.mentions.some((mention: any) => 
+          mention.key === `@_user_${account.appId}` || mention.name === 'OpenClaw'
+        );
+        
+        // 如果要求提及但未提及，忽略消息
+        if (!mentionedBot && message.chat_type !== 'p2p') {
+          return null;
+        }
+      }
+
       return {
         id: message.message_id,
         channelType: this.type,
         channelId: this.id,
         userId: message.sender?.sender_id?.user_id || message.sender?.sender_id?.open_id || 'unknown',
         conversationId: message.chat_id || message.open_chat_id || 'unknown',
-        content: message.content || '',
+        content,
         messageType: this.extractMessageType(message),
         timestamp: new Date(parseInt(message.create_time) * 1000),
         metadata: {
           event,
           message_type: message.message_type,
           chat_type: message.chat_type,
+          mentioned_bot: mentionedBot,
+          account_id: account.accountId,
         },
       };
     }
@@ -329,6 +565,8 @@ export class FeishuChannel implements Channel {
     switch (message.message_type) {
       case 'text':
         return 'text';
+      case 'post':
+        return 'markdown';
       case 'image':
         return 'image';
       case 'file':
@@ -337,24 +575,11 @@ export class FeishuChannel implements Channel {
         return 'audio';
       case 'media':
         return 'media';
+      case 'interactive':
+        return 'interactive';
       default:
         return 'text';
     }
-  }
-
-  /**
-   * 验证签名
-   */
-  private verifySignature(event: any): boolean {
-    // 飞书签名验证逻辑
-    // 参考：https://open.feishu.cn/document/server-docs/event-subscription-guide/event-subscription-concepts
-    if (!this.config.encryptKey || !event.header || !event.header.token) {
-      return true; // 如果没有配置加密密钥，跳过验证
-    }
-
-    // 这里实现实际的签名验证逻辑
-    // 由于时间关系，这里简化为返回true
-    return true;
   }
 
   /**

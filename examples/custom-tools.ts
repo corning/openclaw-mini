@@ -3,7 +3,7 @@
  *
  * 事件消费方式: agent.subscribe() 订阅类型化事件（对齐 pi-agent-core Agent.subscribe）
  */
-
+import "dotenv/config";
 import { Agent, builtinTools, type Tool } from "../src/index.js";
 
 // 自定义工具: 获取当前时间
@@ -50,7 +50,9 @@ const calcTool: Tool<{ expression: string }> = {
 
 async function main() {
   const agent = new Agent({
-    apiKey: process.env.ANTHROPIC_API_KEY!,
+    apiKey: process.env.OPENAI_API_KEY,
+    provider: process.env.OPENCLAW_MINI_PROVIDER,
+    model: process.env.OPENCLAW_MINI_MODEL,
     // 组合内置工具和自定义工具
     tools: [...builtinTools, timeTool, calcTool],
     systemPrompt: `你是一个助手，可以使用以下工具：

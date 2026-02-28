@@ -3,12 +3,14 @@
  *
  * 事件消费方式: agent.subscribe() 订阅类型化事件（对齐 pi-agent-core Agent.subscribe）
  */
-
+import "dotenv/config";
 import { Agent } from "../src/index.js";
 
 async function main() {
   const agent = new Agent({
-    apiKey: process.env.ANTHROPIC_API_KEY!,
+    apiKey: process.env.OPENAI_API_KEY,
+    provider: process.env.OPENCLAW_MINI_PROVIDER,
+    model: process.env.OPENCLAW_MINI_MODEL,
     workspaceDir: process.cwd(),
   });
 
