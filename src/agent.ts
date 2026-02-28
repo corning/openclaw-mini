@@ -291,6 +291,8 @@ export class Agent {
         throw new Error(`未知 provider: ${provider}，请指定 modelDef。`);
       }
       const baseUrl = config.baseUrl ?? ""
+      // 不支持developer role 的模型 阿里、deepseek 模型不支持此默认参数
+      const unsupportedModel = ['dashscope', 'deepseek'];
       modelDef = {
         id: modelId,
         name: modelId,
@@ -303,8 +305,7 @@ export class Agent {
         contextWindow: 200_000,
         maxTokens: 8192,
         compat: {
-          // 阿里模型不支持此默认参数
-          supportsDeveloperRole: !(baseUrl.indexOf("dashscope") > -1)
+          supportsDeveloperRole: !unsupportedModel.some(name => baseUrl.indexOf(name) > -1)
         }
       };
     }
@@ -362,7 +363,7 @@ export class Agent {
     this.heartbeat = new HeartbeatManager(this.workspaceDir, {
       intervalMs: config.heartbeatInterval,
     });
-    
+
     // 初始化渠道工具管理器
     this.channelToolManager = createDefaultChannelToolManager({
       channelManager: config.channels?.manager,
