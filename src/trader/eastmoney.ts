@@ -6,8 +6,8 @@ import { WebTrader } from './webtrader.js';
 import { Balance, Position, Entrust, Deal } from './model.js';
 import { TradeError, NotLoginError } from './exceptions.js';
 import { eastMoneyConfig, EastMoneyConfig } from './config.js';
-import type { CaptchaRecognizer } from './captcha/types.js';
-import { TesseractCaptchaRecognizer } from './captcha/tesseract-recognizer.js';
+import type { CaptchaRecognizerObject } from './captcha/types.js';
+import { CaptchaRecognizer } from './captcha/captcha-recognizer.js';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 
@@ -84,7 +84,7 @@ export interface EastMoneyTraderOptions {
      * 验证码识别器
      * 如果不提供，将使用默认识别器
      */
-    captchaRecognizer?: CaptchaRecognizer;
+    captchaRecognizer?: CaptchaRecognizerObject;
 }
 
 export class EastMoneyTrader extends WebTrader {
@@ -93,7 +93,7 @@ export class EastMoneyTrader extends WebTrader {
     private multiple: number = 1000000;
     private sessionFile: string = 'eastmoney_trader.session';
     private randomNumber: string = '0.9033461201665647898';
-    private captchaRecognizer: CaptchaRecognizer;
+    private captchaRecognizer: CaptchaRecognizerObject;
     private client: Axios;
 
     // HTTP会话
@@ -123,7 +123,7 @@ export class EastMoneyTrader extends WebTrader {
             this.captchaRecognizer = options.captchaRecognizer;
         } else {
             // 使用模拟识别器作为默认
-            this.captchaRecognizer = new TesseractCaptchaRecognizer();
+            this.captchaRecognizer = new CaptchaRecognizer();
         }
 
         // 尝试恢复会话
@@ -216,6 +216,7 @@ export class EastMoneyTrader extends WebTrader {
                 const sessionData = JSON.parse(data);
                 this.validateKey = sessionData.validateKey;
                 this.restoreCookies(sessionData.cookies);
+                console.log(`通过会话文件${this.sessionFile}恢复Session`);
                 return true;
             }
         } catch (error) {

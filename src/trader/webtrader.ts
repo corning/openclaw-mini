@@ -34,17 +34,12 @@ export abstract class WebTrader {
 
     /**
      * 登录的统一接口
-     * @param configFile 登录数据文件，若无则选择参数登录模式
      * @param user 各家券商的账号
      * @param password 密码, 券商为加密后的密码
      * @param kwargs 其他参数
      */
-    async prepare(configFile?: string, user?: string, password?: string, kwargs?: any): Promise<void> {
-        if (configFile !== undefined) {
-            this.readConfig(configFile);
-        } else {
-            this._prepareAccount(user, password, kwargs);
-        }
+    async prepare(user?: string, password?: string, kwargs?: any): Promise<void> {
+        this._prepareAccount(user, password, kwargs);
         await this.autoLogin();
     }
 

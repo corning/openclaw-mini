@@ -1,15 +1,10 @@
-/**
- * Tesseract.js 验证码识别器
- * 需要安装依赖: npm install tesseract.js
- */
+import type { CaptchaRecognizerObject, CaptchaRecognitionResult, CaptchaRecognizerOptions } from './types.js';
+import { recognizeCaptcha } from '../../utils.js';
 
-import type { CaptchaRecognizer, CaptchaRecognitionResult, CaptchaRecognizerOptions } from './types.js';
-import { PSM } from 'tesseract.js';
-
-export class TesseractCaptchaRecognizer implements CaptchaRecognizer {
-    readonly name = 'TesseractCaptchaRecognizer';
+export class CaptchaRecognizer implements CaptchaRecognizerObject {
+    readonly name = 'CaptchaRecognizer';
     private options: Required<CaptchaRecognizerOptions>;
-    private tesseract: any = null;
+    private instance: any = null;
 
     constructor(options: CaptchaRecognizerOptions = {}) {
         this.options = {
@@ -21,31 +16,18 @@ export class TesseractCaptchaRecognizer implements CaptchaRecognizer {
     }
 
     /**
-     * 初始化 Tesseract.js
+     * 初始化 instance.js
      */
     private async initialize(): Promise<void> {
-        if (this.tesseract) {
+        if (this.instance) {
             return;
         }
 
         try {
-            // 动态导入 tesseract.js
-            // @ts-ignore - tesseract.js 是可选依赖
-            const { createWorker } = await import('tesseract.js');
-            const worker = await createWorker('eng'); // 使用英文语言包
 
-            // 配置识别参数
-            await worker.setParameters({
-                tessedit_char_whitelist: this.options.charset,
-                tessedit_pageseg_mode: PSM.SINGLE_CHAR, // 单字符模式
-                user_defined_dpi: '300',
-                oem: 1,
-                preserve_interword_spaces: '0'
-            });
-
-            this.tesseract = worker;
+            this.instance = new CaptchaRecognizer();
         } catch (error) {
-            throw new Error(`Failed to initialize Tesseract.js: ${error}. Make sure tesseract.js is installed: npm install tesseract.js`);
+            throw new Error(`Failed to initialize error: ${error}.`);
         }
     }
 
@@ -68,9 +50,9 @@ export class TesseractCaptchaRecognizer implements CaptchaRecognizer {
 
         for (let attempt = 1; attempt <= this.options.maxRetries; attempt++) {
             try {
-                // 使用 Tesseract 识别
-                const { data: { text, confidence } } = await this.tesseract.recognize(imageBuffer);
 
+                const resultData = await recognizeCaptcha(imageBuffer.toString('base64'));
+                const text = resultData.data?.code || '';
                 // 清理识别结果：移除空格和换行
                 const cleanedText = text.replace(/\s+/g, '');
 
@@ -84,19 +66,16 @@ export class TesseractCaptchaRecognizer implements CaptchaRecognizer {
                         continue;
                     }
                 }
-
                 const processingTime = Date.now() - startTime;
-
                 return {
                     text: cleanedText,
-                    confidence: confidence / 100, // 转换为 0-1 范围
                     recognizer: this.name,
                     processingTime
                 };
 
             } catch (error) {
                 lastError = error as Error;
-                console.warn(`Tesseract 识别尝试 ${attempt} 失败:`, error);
+                console.warn(`识别尝试 ${attempt} 失败:`, error);
 
                 if (attempt < this.options.maxRetries) {
                     await new Promise(resolve => setTimeout(resolve, this.options.retryDelay));
@@ -111,29 +90,10 @@ export class TesseractCaptchaRecognizer implements CaptchaRecognizer {
      * 释放资源
      */
     async terminate(): Promise<void> {
-        if (this.tesseract) {
-            await this.tesseract.terminate();
-            this.tesseract = null;
+        if (this.instance) {
+            await this.instance.terminate();
+            this.instance = null;
         }
     }
 
-    /**
-     * 获取字符白名单配置
-     */
-    getCharWhitelist(): string {
-        return this.options.charset;
-    }
-
-    /**
-     * 设置字符白名单
-     */
-    setCharWhitelist(charset: string): void {
-        this.options.charset = charset;
-        if (this.tesseract) {
-            // 更新工作器参数
-            this.tesseract.setParameters({
-                tessedit_char_whitelist: charset
-            }).catch(console.error);
-        }
-    }
 }

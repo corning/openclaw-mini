@@ -1,18 +1,15 @@
 /**
- * 测试 TesseractCaptchaRecognizer 的 recognize 方法
- *
+ * 测试 CaptchaRecognizer 的 recognize 方法
+ * 东财验证码识别
  * 使用方法:
- * 1. 确保已安装依赖: npm install tesseract.js
- * 3. 运行: npx tsx examples/test.ts
+ * tesseract.js sharp 以及百度API ocr识别都无法精准识别，只有 python 库 dddocr 识别率较高
  */
-
-import { TesseractCaptchaRecognizer } from '../src/trader/captcha/tesseract-recognizer.js';
+import { CaptchaRecognizer } from '../src/trader/captcha/captcha-recognizer.js';
 import http from 'http';
 async function main() {
-    console.log('=== TesseractCaptchaRecognizer 测试 ===\n');
-
+    console.log('=== CaptchaRecognizer 测试 ===\n');
     // 创建识别器实例
-    const recognizer = new TesseractCaptchaRecognizer({
+    const recognizer = new CaptchaRecognizer({
         expectedLength: 4,      // 期望验证码长度为4位
         charset: '0123456789',  // 只识别数字
         maxRetries: 3,
@@ -20,7 +17,6 @@ async function main() {
     });
 
     console.log(`识别器名称: ${recognizer.name}`);
-    console.log(`字符白名单: ${recognizer.getCharWhitelist()}`);
 
     try {
         // 读取图片文件
@@ -40,11 +36,9 @@ async function main() {
         const imageBuffer = Buffer.from(arrayBuffer);
 
         console.log(`图片大小: ${imageBuffer.length} bytes`);
-
         // 执行识别
         console.log('开始识别验证码...');
         const result = await recognizer.recognize(imageBuffer);
-        // const result = '2323'
 
         http.createServer((req, res) => {
             res.writeHead(200, { 'Content-Type': 'text/html' });

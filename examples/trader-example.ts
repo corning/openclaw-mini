@@ -7,9 +7,8 @@
  *
  * 注意：实际使用时需要真实的东方财富账户，且验证码识别需要额外实现
  */
-
+import "dotenv/config";
 import EastMoneyTrader from '../src/trader/index.js';
-
 async function main() {
     console.log('=== 东方财富交易客户端示例 ===');
 
@@ -21,7 +20,7 @@ async function main() {
     try {
         // 准备账户（模拟账户，实际需要真实账户）
         console.log('1. 准备账户...');
-        await trader.prepare(undefined, '', '');
+        await trader.prepare(process.env.STOCK_EASTMONEY_USERNAME, process.env.STOCK_EASTMONEY_PASSWORD);
 
         console.log('2. 获取资金余额...');
         const balance = await trader.getBalance();

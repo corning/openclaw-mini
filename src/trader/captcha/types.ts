@@ -2,7 +2,7 @@
  * 验证码识别器接口
  */
 
-export interface CaptchaRecognizer {
+export interface CaptchaRecognizerObject {
     /**
      * 识别验证码图片
      * @param imageBuffer 验证码图片的二进制数据
@@ -49,11 +49,6 @@ export interface CaptchaRecognitionResult {
      * 识别出的文本
      */
     text: string;
-
-    /**
-     * 置信度（0-1）
-     */
-    confidence: number;
 
     /**
      * 识别器名称
