@@ -35,7 +35,7 @@ import type { Message } from "./session.js";
 export type MiniAgentEvent =
   // 核心生命周期（对齐 pi-agent-core: agent_start / agent_end）
   | { type: "agent_start"; runId: string; sessionKey: string; agentId: string; model: string }
-  | { type: "agent_end"; runId: string; messages: Message[] }
+  | { type: "agent_end"; runId: string; messages: Message[]; turns: any; toolCalls: any }
   | { type: "agent_error"; runId: string; error: string }
 
   // 轮次（对齐 pi-agent-core: turn_start / turn_end）

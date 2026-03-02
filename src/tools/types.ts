@@ -30,6 +30,7 @@
  */
 
 import type { MemoryManager, MemorySearchResult } from "../memory.js";
+import type { FeishuChannel } from "../channels/feishu.js";
 
 // ============== 执行上下文 ==============
 
@@ -39,6 +40,7 @@ import type { MemoryManager, MemorySearchResult } from "../memory.js";
  * 每次工具执行时传入，提供运行时信息
  */
 export interface ToolContext {
+  metadata: { feishuChannel?: FeishuChannel | undefined; };
   /** 工作目录: 文件操作的基准路径，防止访问工作区外的文件 */
   workspaceDir: string;
   /** 会话 Key: 用于隔离不同 agent / 会话的状态 */

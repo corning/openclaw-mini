@@ -136,7 +136,7 @@ export class FeishuChannel implements Channel {
    */
   private createFeishuClient(account: FeishuAccountConfig): Lark.Client {
     const cacheKey = `${this.id}:${account.accountId}`;
-    
+
     // 检查缓存
     const cached = clientCache.get(cacheKey);
     if (cached) {
@@ -146,7 +146,7 @@ export class FeishuChannel implements Channel {
     // 创建新客户端
     const domain = account.domain || this.config.domain || 'feishu';
     let resolvedDomain: string | Lark.Domain;
-    
+
     if (domain === 'lark') {
       resolvedDomain = Lark.Domain.Lark;
     } else if (domain === 'feishu') {
@@ -170,10 +170,10 @@ export class FeishuChannel implements Channel {
 
   async initialize(): Promise<void> {
     console.log(`[FeishuChannel:${this.id}] Initializing...`);
-    
+
     // 获取活动账户
     const account = this.getActiveAccount();
-    
+
     // 验证配置
     if (!account.appId || !account.appSecret) {
       throw new Error('Feishu appId and appSecret are required');
@@ -181,7 +181,7 @@ export class FeishuChannel implements Channel {
 
     // 创建客户端
     this.client = this.createFeishuClient(account);
-    
+
     // 如果是websocket模式，准备创建websocket客户端
     const connectionMode = account.connectionMode || this.config.connectionMode || 'webhook';
     if (connectionMode === 'websocket') {
@@ -211,7 +211,7 @@ export class FeishuChannel implements Channel {
     }
 
     console.log(`[FeishuChannel:${this.id}] Connecting...`);
-    
+
     try {
       const account = this.getActiveAccount();
       const connectionMode = account.connectionMode || this.config.connectionMode || 'webhook';
@@ -225,7 +225,7 @@ export class FeishuChannel implements Channel {
           }
 
           this.wsClient.start();
-          
+
           // 监听事件
           this.wsClient.on('ready', () => {
             console.log(`[FeishuChannel:${this.id}] WebSocket connected`);
@@ -252,10 +252,10 @@ export class FeishuChannel implements Channel {
       }
     } catch (error) {
       console.error(`[FeishuChannel:${this.id}] Connection failed:`, error);
-      this.emitEvent({ 
-        type: 'error', 
-        data: { error: error instanceof Error ? error.message : String(error) }, 
-        timestamp: new Date() 
+      this.emitEvent({
+        type: 'error',
+        data: { error: error instanceof Error ? error.message : String(error) },
+        timestamp: new Date()
       });
       throw error;
     }
@@ -267,14 +267,14 @@ export class FeishuChannel implements Channel {
     }
 
     console.log(`[FeishuChannel:${this.id}] Disconnecting...`);
-    
+
     // 关闭WebSocket连接
     if (this.wsClient) {
-      this.wsClient.stop();
+      this.wsClient.close();
     }
-    
+
     this.connectedState = false;
-    
+
     console.log(`[FeishuChannel:${this.id}] Disconnected`);
     this.emitEvent({ type: 'disconnected', data: { id: this.id }, timestamp: new Date() });
   }
@@ -289,7 +289,7 @@ export class FeishuChannel implements Channel {
 
       // 根据消息类型发送到飞书
       const response = await this.sendToFeishu(message);
-      
+
       return {
         success: true,
         messageId: response.message_id,
@@ -298,7 +298,7 @@ export class FeishuChannel implements Channel {
       };
     } catch (error) {
       console.error(`[FeishuChannel:${this.id}] Failed to send message:`, error);
-      
+
       return {
         success: false,
         error: error instanceof Error ? error.message : String(error),
@@ -321,7 +321,7 @@ export class FeishuChannel implements Channel {
   async handleWebhookEvent(event: any): Promise<void> {
     try {
       const account = this.getActiveAccount();
-      
+
       // 如果有事件分发器，使用它验证和解析事件
       if (this.eventDispatcher) {
         const verified = this.eventDispatcher.verifySignature(event);
@@ -355,7 +355,7 @@ export class FeishuChannel implements Channel {
   getInfo(): Record<string, any> {
     const account = this.getActiveAccount();
     const connectionMode = account.connectionMode || this.config.connectionMode || 'webhook';
-    
+
     return {
       type: this.type,
       id: this.id,
@@ -377,15 +377,15 @@ export class FeishuChannel implements Channel {
    */
   getAccounts(): FeishuAccountConfig[] {
     const accounts: FeishuAccountConfig[] = [];
-    
+
     if (this.config.defaultAccount) {
       accounts.push(this.config.defaultAccount);
     }
-    
+
     if (this.config.accounts) {
       accounts.push(...Object.values(this.config.accounts));
     }
-    
+
     return accounts;
   }
 
@@ -413,7 +413,7 @@ export class FeishuChannel implements Channel {
     const account = this.getActiveAccount();
     const receiveId = message.conversationId || message.userId;
     const msgType = message.messageType === 'markdown' ? 'interactive' : 'text';
-    
+
     // 构建消息内容
     let content: string;
     if (msgType === 'interactive') {
@@ -495,12 +495,12 @@ export class FeishuChannel implements Channel {
     }
 
     const feishuEvent = event.event;
-    
+
     // 处理消息事件
     if (feishuEvent.type === 'message' && feishuEvent.message) {
       const message = feishuEvent.message;
       const account = this.getActiveAccount();
-      
+
       // 提取消息内容
       let content = '';
       if (message.message_type === 'text') {
@@ -519,13 +519,13 @@ export class FeishuChannel implements Channel {
       // 检查是否需要提及机器人
       const requireMention = account.requireMention || this.config.requireMention;
       let mentionedBot = false;
-      
+
       if (requireMention && message.mentions) {
         // 检查是否提及了机器人
-        mentionedBot = message.mentions.some((mention: any) => 
+        mentionedBot = message.mentions.some((mention: any) =>
           mention.key === `@_user_${account.appId}` || mention.name === 'OpenClaw'
         );
-        
+
         // 如果要求提及但未提及，忽略消息
         if (!mentionedBot && message.chat_type !== 'p2p') {
           return null;
