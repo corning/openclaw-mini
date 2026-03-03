@@ -33,7 +33,7 @@ async function main() {
 
         console.log('4. 获取委托单...');
         const entrusts = await trader.getEntrust();
-        console.log('委托单数量:', entrusts.length);
+        console.log('委托单:', entrusts[0]);
 
         console.log('5. 获取当日成交...');
         const deals = await trader.getCurrentDeal();
@@ -44,10 +44,10 @@ async function main() {
         console.log('注：以下操作不会实际执行，仅展示API调用方式');
 
         // 示例：买入100股某股票，价格10元
-        // await trader.buy('000001', 10.0, 100);
+        // await trader.buy('600928', 3.68, 100);
 
         // 示例：卖出50股某股票，价格11元
-        // await trader.sell('000001', 11.0, 50);
+        // await trader.sell('600928', 4.14, 5000);
 
         console.log('\n=== 示例完成 ===');
 

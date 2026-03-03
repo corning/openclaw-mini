@@ -52,6 +52,8 @@ interface ApiResponse {
     Status: number;
     Data: any;
     Message?: string;
+    Errcode?: number;
+    Count?: number;
 }
 
 /**
@@ -201,12 +203,11 @@ export class EastMoneyTrader extends WebTrader {
                 // 反序列化到新 CookieJar
                 const restoredJar = await CookieJar.deserialize({ cookies });
                 const nowTime = Date.now()
-                // 过滤过期 cookies（关键！）
-                const validCookies = restoredJar.getCookiesSync(eastMoneyConfig.domain).filter(c => {
-                    return c.expiryDate()?.getTime() || 0 > nowTime
-                });
-                if (validCookies.length === 0) {
-                    console.log('⚠️  所有 cookies 已过期，跳过恢复');
+                const timestamp = sessionData.timestamp;
+                // 判断 cookies 是否过期（关键！），默认30分钟内有效
+                console.log(`Cookies 更新时间: ${(Math.floor(nowTime - timestamp) / 1000 / 60)}分钟前`);
+                if (nowTime - timestamp > 60 * 25 * 1000) {
+                    console.log('⚠️  Cookies 已超过25分钟，跳过恢复');
                     return false;
                 } else {
                     // 恢复 cookies
@@ -481,8 +482,22 @@ export class EastMoneyTrader extends WebTrader {
      * 撤销委托
      */
     async cancelEntrust(entrustNo: string): Promise<boolean> {
-        // TODO: 实现撤销委托
-        console.log(`撤销委托 ${entrustNo} (功能待实现)`);
+        const formData = new URLSearchParams();
+        const date = new Date();
+        const dateStr = `${date.getFullYear()}${(date.getMonth() + 1) > 9 ? date.getMonth() + 1 : '0' + date.getMonth() + 1}${date.getDate() > 9 ? date.getDate() : '0' + date.getDate()}`
+        formData.append('wtrq', dateStr);
+        formData.append('wtbh', entrustNo);
+        formData.append('market', 'HA');
+        formData.append('mmlb', '0S');
+        const response = await this.client.post(this._getApiUrl('cancel_stock'), {
+            body: formData
+        });
+        const result = await response.data as ApiResponse;
+        if (result.Status !== 0) {
+            console.log(`撤销失败, ${JSON.stringify(result)}`);
+            return false;
+        }
+        console.log(`撤销委托 ${entrustNo} 成功`);
         return true;
     }
 
@@ -490,14 +505,17 @@ export class EastMoneyTrader extends WebTrader {
      * 交易核心方法
      */
     private async _trade(security: string, price: number = 0, amount: number = 0, volume: number = 0, entrustBs: string = 'B'): Promise<void> {
-        const balance = (await this.getBalance())[0];
 
-        if (!volume) {
-            volume = Math.floor(price * amount);
-        }
+        // 挂买单才需要去核验是否够金额
+        if (entrustBs === 'B') {
+            const balance = (await this.getBalance())[0];
+            if (!volume) {
+                volume = Math.floor(price * amount);
+            }
 
-        if (balance.enableBalance < volume && entrustBs === 'B') {
-            throw new TradeError('没有足够的现金进行操作');
+            if (balance.enableBalance < volume && entrustBs === 'B') {
+                throw new TradeError('没有足够的现金进行操作');
+            }
         }
 
         if (amount === 0) {
