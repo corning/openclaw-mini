@@ -20,6 +20,7 @@ export interface EastMoneyConfig {
     get_convertible_bond_list_v2: string;
     submit_bat_trade_v2: string;
     cancel_stock: string;
+    get_stock_today_info: string;
 }
 
 export const eastMoneyConfig: EastMoneyConfig = {
@@ -39,5 +40,6 @@ export const eastMoneyConfig: EastMoneyConfig = {
     get_can_buy_new_stock_list_v3: "https://jywg.18.cn/Trade/GetCanBuyNewStockListV3?validatekey=%s",
     get_convertible_bond_list_v2: "https://jywg.18.cn/Trade/GetConvertibleBondListV2?validatekey=%s",
     submit_bat_trade_v2: "https://jywg.18.cn/Trade/SubmitBatTradeV2?validatekey=%s",
-    cancel_stock: "https://jywg.18.cn/Trade/cancelStockWEB?validatekey=%s"
+    cancel_stock: "https://jywg.18.cn/Trade/cancelStockWEB?validatekey=%s",
+    get_stock_today_info: "https://jywg.18.cn/Trade/GetKyzjAndKmlV2?validatekey=%s",
 };

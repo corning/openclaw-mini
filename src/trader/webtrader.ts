@@ -140,9 +140,8 @@ export abstract class WebTrader {
      * @param price 买入价格
      * @param amount 买入股数
      * @param volume 买入总金额 由 volume / price 取整，若指定 price 则此参数无效
-     * @param entrustProp 委托属性
      */
-    async buy(security: string, price: number = 0, amount: number = 0, volume: number = 0, entrustProp: number = 0): Promise<void> {
+    async buy(security: string, price: number = 0, amount: number = 0, volume: number = 0): Promise<void> {
         throw new Error('子类必须实现 buy 方法');
     }
 
@@ -152,9 +151,8 @@ export abstract class WebTrader {
      * @param price 卖出价格
      * @param amount 卖出股数
      * @param volume 卖出总金额 由 volume / price 取整，若指定 price 则此参数无效
-     * @param entrustProp 委托属性
      */
-    async sell(security: string, price: number = 0, amount: number = 0, volume: number = 0, entrustProp: number = 0): Promise<void> {
+    async sell(security: string, price: number = 0, amount: number = 0, volume: number = 0): Promise<void> {
         throw new Error('子类必须实现 sell 方法');
     }
 

@@ -8,7 +8,7 @@
  * 注意：实际使用时需要真实的东方财富账户，且验证码识别需要额外实现
  */
 import "dotenv/config";
-import EastMoneyTrader from '../src/trader/index.js';
+import EastMoneyTrader, { EntrustStatus } from '../src/trader/index.js';
 async function main() {
     console.log('=== 东方财富交易客户端示例 ===');
 
@@ -33,11 +33,23 @@ async function main() {
 
         console.log('4. 获取委托单...');
         const entrusts = await trader.getEntrust();
-        console.log('委托单:', entrusts[0]);
+        console.log('第一个委托单:', entrusts[0]);
+        const cancelOrders = entrusts.filter(e => (e.entrustStatus === EntrustStatus.Pending || e.entrustStatus === EntrustStatus.Waiting));
+
+        console.log(`总共${entrusts.length}个委托单，已提等待${cancelOrders.length}个委托单...`);
+        if (cancelOrders.length > 0) {
+            console.log('撤销第一个已报委托单...', cancelOrders[0]);
+            const result = await trader.cancelEntrust(cancelOrders[0].entrustNo);
+            console.log('撤销结果:', result);
+        }
 
         console.log('5. 获取当日成交...');
         const deals = await trader.getCurrentDeal();
         console.log('当日成交数量:', deals.length);
+
+        console.log('6. 获取股票信息...');
+        const stockInfo = await trader.getStockInfo('600928');
+        console.log('股票信息:', stockInfo);
 
         // 注意：以下交易操作是示例，实际执行需要真实账户和正确的参数
         console.log('\n=== 交易操作示例（模拟）===');
@@ -47,7 +59,7 @@ async function main() {
         // await trader.buy('600928', 3.68, 100);
 
         // 示例：卖出50股某股票，价格11元
-        // await trader.sell('600928', 4.14, 5000);
+        await trader.sell('600928', 4.11, 5000);
 
         console.log('\n=== 示例完成 ===');
 

@@ -38,6 +38,21 @@ const HEADERS = {
 }
 
 /**
+ * 订单状态枚举
+ */
+export enum EntrustStatus {
+    Waiting = '未报', // 未报,等待券商提交处理
+    Pending = '已报', // 已报,等待成交
+    Canceled = '已撤', // 已撤单
+    Partial = 1, // 部分成交
+    Completed = 2, // 全部成交
+    Rejected = 4, // 拒单
+    PartialCanceled = 5, // 部分撤单
+    PartialRejected = 6, // 部分拒单
+    PartialCompleted = 7, // 部分成交撤销
+}
+
+/**
  * 登录响应接口
  */
 interface LoginResponse {
@@ -54,6 +69,21 @@ interface ApiResponse {
     Message?: string;
     Errcode?: number;
     Count?: number;
+}
+
+/**
+ * 股票信息接口
+ */
+interface StockInfo {
+    Code: string;
+    Name: string;
+    Market: string;
+    MaxPrice: number;
+    MinPrice: number;
+}
+
+interface StockCacheInfo {
+    [key: string]: StockInfo
 }
 
 /**
@@ -91,6 +121,7 @@ export class EastMoneyTrader extends WebTrader {
     private randomNumber: string = '0.9033461201665647898';
     private captchaRecognizer: CaptchaRecognizerObject;
     private client: Axios;
+    private stockCache: StockCacheInfo = {};
 
     // HTTP会话
     private session: any; // 使用简单的对象存储cookie等，实际可使用fetch with cookie jar
@@ -242,6 +273,22 @@ export class EastMoneyTrader extends WebTrader {
     }
 
     /**
+     * 发送POST请求
+     * @param url 
+     * @param formData 
+     * @returns 
+     */
+    private async _postData(url: string, formData: any): Promise<any> {
+        const response = await this.client.post(url, formData, {
+            headers: {
+                "Content-Type": 'application/x-www-form-urlencoded',  // 必须设置！
+                "gw_reqtimestamp": Math.floor(10 + Math.random() * 1000),
+            }
+        });
+        return response;
+    }
+
+    /**
      * 自动登录
      */
     async autoLogin(kwargs?: any): Promise<void> {
@@ -270,13 +317,7 @@ export class EastMoneyTrader extends WebTrader {
             formData.append('secInfo', secInfo);
 
             try {
-                const response = await this.client.post(this.config.authentication, formData, {
-                    headers: {
-                        "Content-Type": 'application/x-www-form-urlencoded',  // 必须设置！
-                        "gw_reqtimestamp": Math.floor(10 + Math.random() * 1000),
-                    }
-                });
-
+                const response = await this._postData(this.config.authentication, formData);
                 const loginRes = await response.data as LoginResponse;
 
                 if (loginRes.Status !== 0) {
@@ -367,6 +408,45 @@ export class EastMoneyTrader extends WebTrader {
         // TODO: 错误处理
         console.error('请求失败:', result);
         return null;
+    }
+
+    /**
+     * 获取股票信息
+     */
+    async getStockInfo(stockCode: string): Promise<StockInfo> {
+        // 判断是否存在缓存中
+        if (this.stockCache[stockCode]) {
+            return this.stockCache[stockCode];
+        }
+        const formData = new URLSearchParams();
+        formData.append('stockCode', stockCode);
+        // 查询委托价格是否合理，这里不传接口会返回 Status非0
+        // formData.append('price', '3.75');
+        // formData.append('tradeType', 'B');
+        // formData.append('stockName', '西安银行');
+        // formData.append('market', 'HA');
+        const response = await this._postData(this._getApiUrl('get_stock_today_info'), formData);
+
+        const result = response.data as ApiResponse;
+
+        if (!result.Data) {
+            throw new TradeError(`获取股票信息失败: ${JSON.stringify(result)}`);
+        }
+
+        const ZqInfo = result.Data?.ZqInfo || {};
+        console.log(`获取 ${stockCode} 股票信息结果：${JSON.stringify(ZqInfo)}`);
+
+        const stockInfo = {
+            Code: ZqInfo.Zqdm,
+            Name: ZqInfo.Zqmc,
+            Market: ZqInfo.Market,
+            MaxPrice: parseFloat(ZqInfo.Ztjg),
+            MinPrice: parseFloat(ZqInfo.Dtjg),
+        } as StockInfo;
+
+        this.stockCache[stockCode] = stockInfo;
+
+        return stockInfo;
     }
 
     /**
@@ -489,10 +569,8 @@ export class EastMoneyTrader extends WebTrader {
         formData.append('wtbh', entrustNo);
         formData.append('market', 'HA');
         formData.append('mmlb', '0S');
-        const response = await this.client.post(this._getApiUrl('cancel_stock'), {
-            body: formData
-        });
-        const result = await response.data as ApiResponse;
+        const response = await this._postData(this._getApiUrl('cancel_stock'), formData);
+        const result = response.data as ApiResponse;
         if (result.Status !== 0) {
             console.log(`撤销失败, ${JSON.stringify(result)}`);
             return false;
@@ -506,6 +584,8 @@ export class EastMoneyTrader extends WebTrader {
      */
     private async _trade(security: string, price: number = 0, amount: number = 0, volume: number = 0, entrustBs: string = 'B'): Promise<void> {
 
+        const stockInfo = await this.getStockInfo(security)
+
         // 挂买单才需要去核验是否够金额
         if (entrustBs === 'B') {
             const balance = (await this.getBalance())[0];
@@ -513,8 +593,17 @@ export class EastMoneyTrader extends WebTrader {
                 volume = Math.floor(price * amount);
             }
 
-            if (balance.enableBalance < volume && entrustBs === 'B') {
+            if (balance.enableBalance < volume) {
                 throw new TradeError('没有足够的现金进行操作');
+            }
+
+            if (price < stockInfo.MinPrice) {
+                throw new TradeError('价格低于最小允许价格');
+            }
+
+        } else {
+            if (price > stockInfo.MaxPrice) {
+                throw new TradeError('价格超过最大允许价格');
             }
         }
 
@@ -526,14 +615,14 @@ export class EastMoneyTrader extends WebTrader {
         formData.append('stockCode', security);
         formData.append('price', price.toString());
         formData.append('amount', amount.toString());
-        formData.append('zqmc', 'unknown');
+        formData.append('zqmc', stockInfo.Name);
         formData.append('tradeType', entrustBs);
+        formData.append('market', stockInfo.Market);
+        // formData.append('gddm', 'A253992969');
 
-        const response = await this.client.post(this._getApiUrl('submit'), {
-            body: formData
-        });
+        const response = await this._postData(this._getApiUrl('submit'), formData);
 
-        const result = await response.data as ApiResponse;
+        const result = response.data as ApiResponse;
         if (result.Status !== 0) {
             throw new TradeError(`下单失败, ${JSON.stringify(result)}`);
         }
@@ -544,14 +633,14 @@ export class EastMoneyTrader extends WebTrader {
     /**
      * 买入股票
      */
-    async buy(security: string, price: number = 0, amount: number = 0, volume: number = 0, entrustProp: number = 0): Promise<void> {
+    async buy(security: string, price: number = 0, amount: number = 0, volume: number = 0): Promise<void> {
         return this._trade(security, price, amount, volume, 'B');
     }
 
     /**
      * 卖出股票
      */
-    async sell(security: string, price: number = 0, amount: number = 0, volume: number = 0, entrustProp: number = 0): Promise<void> {
+    async sell(security: string, price: number = 0, amount: number = 0, volume: number = 0): Promise<void> {
         return this._trade(security, price, amount, volume, 'S');
     }
 
