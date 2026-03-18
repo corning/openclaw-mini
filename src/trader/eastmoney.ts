@@ -1,7 +1,7 @@
 /**
  * 东方财富证券交易客户端
  */
-
+import "dotenv/config";
 import { WebTrader } from './webtrader.js';
 import { Balance, Position, Entrust, Deal } from './model.js';
 import { TradeError, NotLoginError } from './exceptions.js';
@@ -43,6 +43,7 @@ const HEADERS = {
 export enum EntrustStatus {
     Waiting = '未报', // 未报,等待券商提交处理
     Pending = '已报', // 已报,等待成交
+    Listing = '正报', // 正报，开盘前
     Canceled = '已撤', // 已撤单
     Partial = 1, // 部分成交
     Completed = 2, // 全部成交
@@ -114,6 +115,12 @@ export interface EastMoneyTraderOptions {
     captchaRecognizer?: CaptchaRecognizerObject;
 }
 
+/**
+ * 从配置文件中读取用户名密码
+ */
+const USERNAME = process.env.STOCK_EASTMONEY_USERNAME;
+const PASSWORD = process.env.STOCK_EASTMONEY_PASSWORD;
+
 export class EastMoneyTrader extends WebTrader {
     protected config: EastMoneyConfig = eastMoneyConfig;
     private validateKey: string | null = null;
@@ -138,13 +145,24 @@ export class EastMoneyTrader extends WebTrader {
         this.session = jar;
 
         // 验证码识别器
-        if (options?.captchaRecognizer) {
-            this.captchaRecognizer = options.captchaRecognizer;
-        } else {
-            // 使用模拟识别器作为默认
-            this.captchaRecognizer = new CaptchaRecognizer();
-        }
+        this.captchaRecognizer = new CaptchaRecognizer();
 
+        // 从环境变量读取配置
+        if (USERNAME && PASSWORD) {
+            this.accountConfig = { user: USERNAME, password: PASSWORD };
+        } else {
+            console.warn('未配置股票交易账户，请设置 STOCK_EASTMONEY_USERNAME 和 STOCK_EASTMONEY_PASSWORD 环境变量');
+        }
+    }
+
+    /**
+     * 等待登录完成
+     */
+    async ensureLoggedIn(): Promise<void> {
+        if (!this.accountConfig) {
+            throw new NotLoginError('未配置交易账户，请设置 STOCK_EASTMONEY_USERNAME 和 STOCK_EASTMONEY_PASSWORD 环境变量');
+        }
+        await this.autoLogin();
     }
 
     /**
@@ -296,9 +314,7 @@ export class EastMoneyTrader extends WebTrader {
             return;
         }
 
-        if (!this.accountConfig) {
-            throw new Error('账户配置未设置，请先调用 prepare 方法');
-        }
+        // accountConfig 已在构造函数中从环境变量加载
 
         while (true) {
 
@@ -633,15 +649,17 @@ export class EastMoneyTrader extends WebTrader {
     /**
      * 买入股票
      */
-    async buy(security: string, price: number = 0, amount: number = 0, volume: number = 0): Promise<void> {
-        return this._trade(security, price, amount, volume, 'B');
+    async buy(stockCode: string, price: number, amount: number): Promise<void> {
+        await this.ensureLoggedIn();
+        return this._trade(stockCode, price, amount, 0, 'B');
     }
 
     /**
      * 卖出股票
      */
-    async sell(security: string, price: number = 0, amount: number = 0, volume: number = 0): Promise<void> {
-        return this._trade(security, price, amount, volume, 'S');
+    async sell(stockCode: string, price: number, amount: number): Promise<void> {
+        await this.ensureLoggedIn();
+        return this._trade(stockCode, price, amount, 0, 'S');
     }
 
     /**

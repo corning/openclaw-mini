@@ -7,31 +7,27 @@
  *
  * 注意：实际使用时需要真实的东方财富账户，且验证码识别需要额外实现
  */
-import "dotenv/config";
 import EastMoneyTrader, { EntrustStatus } from '../src/trader/index.js';
 async function main() {
     console.log('=== 东方财富交易客户端示例 ===');
 
     // 创建交易客户端
     const trader = new EastMoneyTrader({});
+    await trader.ensureLoggedIn();
 
     try {
-        // 准备账户（模拟账户，实际需要真实账户）
-        console.log('1. 准备账户...');
-        await trader.prepare(process.env.STOCK_EASTMONEY_USERNAME, process.env.STOCK_EASTMONEY_PASSWORD);
-
-        console.log('2. 获取资金余额...');
+        console.log('1. 获取资金余额...');
         const balance = await trader.getBalance();
         console.log('资金余额:', balance);
 
-        console.log('3. 获取持仓...');
+        console.log('2. 获取持仓...');
         const positions = await trader.getPosition();
         console.log('持仓数量:', positions.length);
         if (positions.length > 0) {
             console.log('第一个持仓:', positions[0]);
         }
 
-        console.log('4. 获取委托单...');
+        console.log('3. 获取委托单...');
         const entrusts = await trader.getEntrust();
         console.log('第一个委托单:', entrusts[0]);
         const cancelOrders = entrusts.filter(e => (e.entrustStatus === EntrustStatus.Pending || e.entrustStatus === EntrustStatus.Waiting));
@@ -43,11 +39,11 @@ async function main() {
             console.log('撤销结果:', result);
         }
 
-        console.log('5. 获取当日成交...');
+        console.log('4. 获取当日成交...');
         const deals = await trader.getCurrentDeal();
         console.log('当日成交数量:', deals.length);
 
-        console.log('6. 获取股票信息...');
+        console.log('5. 获取股票信息...');
         const stockInfo = await trader.getStockInfo('600928');
         console.log('股票信息:', stockInfo);
 

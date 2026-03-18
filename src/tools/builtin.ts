@@ -624,6 +624,10 @@ export const sessionsSpawnTool: Tool<{
 
 import { channelTools } from "./channel.js";
 
+// ============== 交易工具 ==============
+
+import { traderTools } from "./trader.js";
+
 // ============== 导出 ==============
 
 /**
@@ -635,6 +639,7 @@ import { channelTools } from "./channel.js";
  * - 记忆: memory_search, memory_get, memory_save
  * - 编排: sessions_spawn
  * - 渠道: channel_send, channel_status, channel_broadcast
+ * - 交易: trader_login, trader_balance, trader_position, trader_buy, trader_sell, etc.
  *
  * OpenClaw 有 50+ 工具，包括:
  * - 浏览器自动化 (Puppeteer)
@@ -657,4 +662,5 @@ export const builtinTools: Tool[] = [
   memorySaveTool,
   sessionsSpawnTool,
   ...channelTools,
+  ...traderTools,
 ];
