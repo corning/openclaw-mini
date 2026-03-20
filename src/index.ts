@@ -145,3 +145,16 @@ export {
 
 // Tool Policy — 工具访问控制 (allow/deny/none 三级编译)
 export { type ToolPolicy, filterToolsByPolicy } from "./tool-policy.js";
+
+// Tool Approval — 工具审批 (运行时拦截 + 三级安全 + allowlist)
+export {
+  type ApprovalSecurity,
+  type ApprovalAsk,
+  type ApprovalDecision,
+  type ApprovalRequest,
+  type ApprovalConfig,
+  type ApprovalHandler,
+  type AllowlistEntry,
+  requiresApproval,
+  AllowlistManager,
+} from "./tool-approval.js";

@@ -55,6 +55,10 @@ export type MiniAgentEvent =
   | { type: "tool_execution_end"; toolCallId: string; toolName: string; result: string; isError: boolean }
   | { type: "tool_skipped"; toolCallId: string; toolName: string }
 
+  // 工具审批（对齐 openclaw: exec-approvals → approval request/resolved 事件）
+  | { type: "tool_approval_request"; toolCallId: string; toolName: string; args: unknown }
+  | { type: "tool_approval_resolved"; toolCallId: string; toolName: string; decision: "allow-once" | "allow-always" | "deny" }
+
   // mini 特有事件
   | { type: "steering"; pendingCount: number }
   | { type: "compaction"; summaryChars: number; droppedMessages: number }

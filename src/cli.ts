@@ -15,6 +15,7 @@ import { Writable } from "node:stream";
 import { Agent } from "./index.js";
 import { resolveSessionKey } from "./session-key.js";
 import { getEnvApiKey } from "@mariozechner/pi-ai";
+import type { ApprovalConfig, ApprovalDecision, ApprovalRequest } from "./tool-approval.js";
 
 // ============== .env 加载 ==============
 
@@ -71,6 +72,7 @@ const badgeStyles = {
   model: `${styles.black}${styles.bgCyan}`,
   tool: `${styles.white}${styles.bgBlue}`,
   think: `${styles.white}${styles.bgMagenta}`,
+  approve: `${styles.black}${styles.bgYellow}`,
 } as const;
 
 function color(text: string, c: keyof typeof styles): string {
@@ -181,11 +183,58 @@ async function main() {
   const workspaceDir = process.cwd();
   const sessionKey = resolveSessionKey({ agentId, sessionId });
 
+  // --approval 参数解析
+  const approvalFlag = readFlag(args, "--approval");
+  const approvalEnabled = args.includes("--approval");
+  let approval: ApprovalConfig | undefined;
+  if (approvalEnabled) {
+    const ask = approvalFlag === "always" ? "always" as const : "on-miss" as const;
+    approval = {
+      ask,
+      security: "full",
+      tools: { exec: "allowlist", write: "allowlist", edit: "allowlist" },
+    };
+  }
+
+  // readline（在 agent 之前创建，供审批处理器使用）
+  const rlOutput = new Writable({
+    write(chunk, _encoding, callback) {
+      const text = typeof chunk === "string" ? chunk : chunk.toString();
+      process.stdout.write(text.replace(/\x1b\[0?J/g, ""), callback);
+    },
+  });
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: rlOutput,
+  });
+
+  // 审批处理器（对齐 openclaw: CLI 模式下的 approval prompt）
+  const onApprovalRequest = approval
+    ? async (request: ApprovalRequest): Promise<ApprovalDecision> => {
+        closeOutputLine();
+        const label = formatToolCompact(request.toolName, request.args);
+        return new Promise((resolve) => {
+          rl.question(
+            `${badge("?", badgeStyles.approve)} ${color("approve", "yellow")} ${label}? ${color("[y/n/a]", "dim")} `,
+            (answer) => {
+              const a = answer.trim().toLowerCase();
+              if (a === "a" || a === "always") resolve("allow-always");
+              else if (a === "n" || a === "no" || a === "d" || a === "deny") resolve("deny");
+              else resolve("allow-once");
+            },
+          );
+        });
+      }
+    : undefined;
+
   // Banner
   console.log(`${badge("MINI", badgeStyles.system)} ${color("OpenClaw Mini", "bold")}`);
   console.log(color(`  ${provider}${model ? ` · ${model}` : ""} · ${agentId}`, "dim"));
   console.log(color(`  ${workspaceDir}`, "dim"));
-  console.log(color("  /help 查看命令 · Ctrl+C 退出", "dim"));
+  const hints = ["/help 查看命令"];
+  if (approval) hints.push(`approval: ${approval.ask}`);
+  hints.push("Ctrl+C 退出");
+  console.log(color(`  ${hints.join(" · ")}`, "dim"));
   console.log();
 
   const agent = new Agent({
@@ -195,6 +244,8 @@ async function main() {
     ...(baseUrl ? { baseUrl } : {}),
     agentId,
     workspaceDir,
+    approval,
+    onApprovalRequest,
   });
 
   // 事件订阅（对齐 pi-agent-core: Agent.subscribe → 类型化事件处理）
@@ -238,6 +289,14 @@ async function main() {
         printToolLine(`⊘ ${event.toolName} (skipped)`);
         break;
 
+      case "tool_approval_resolved":
+        if (event.decision === "deny") {
+          printToolLine(`✗ ${event.toolName} (denied)`, true);
+        } else if (event.decision === "allow-always") {
+          printToolLine(`✓ ${event.toolName} (always allowed)`);
+        }
+        break;
+
       case "compaction":
         printSystemLine(`compaction: dropped ${event.droppedMessages} messages`);
         break;
@@ -251,19 +310,6 @@ async function main() {
         printSystemLine(`subagent error: ${event.error}`, "error");
         break;
     }
-  });
-
-  // 过滤 readline 的 clearScreenDown（\x1b[J），避免意外擦屏
-  const rlOutput = new Writable({
-    write(chunk, _encoding, callback) {
-      const text = typeof chunk === "string" ? chunk : chunk.toString();
-      process.stdout.write(text.replace(/\x1b\[0?J/g, ""), callback);
-    },
-  });
-
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: rlOutput,
   });
 
   const prompt = () => {
@@ -363,7 +409,7 @@ async function handleCommand(cmd: string, agent: Agent, sessionKey: string) {
 
   switch (command) {
     case "help":
-      console.log(`命令:\n  /help     显示帮助\n  /reset    重置当前会话\n  /history  显示会话历史\n  /sessions 列出所有会话\n  /quit     退出`);
+      console.log(`命令:\n  /help     显示帮助\n  /reset    重置当前会话\n  /history  显示会话历史\n  /sessions 列出所有会话\n  /quit     退出\n\n启动参数:\n  --approval          启用工具审批 (on-miss 模式)\n  --approval always   每次工具调用都需审批`);
       break;
 
     case "reset":
