@@ -12,8 +12,7 @@ async function main() {
     console.log('=== 东方财富交易客户端示例 ===');
 
     // 创建交易客户端
-    const trader = new EastMoneyTrader({});
-    await trader.ensureLoggedIn();
+    const trader = await EastMoneyTrader.getInstance();
 
     try {
         console.log('1. 获取资金余额...');

@@ -17,7 +17,6 @@
     "gateway:connect": "tsx src/gateway/gateway-cli.ts connect",
     "channel:telegram": "tsx src/channels/channel-cli.ts telegram",
     "example": "tsx examples/basic.ts",
-    "feishu": "tsx examples/feishu-channel.ts",
     "trader:test": "npx tsx examples/trader-example.ts",
     "captch:test": "npx tsx examples/captcha-recognizer.ts"
   },

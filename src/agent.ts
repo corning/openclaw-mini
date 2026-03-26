@@ -26,7 +26,6 @@ import { builtinTools } from "./tools/builtin.js";
 import { wrapToolWithAbortSignal } from "./tools/abort.js";
 import { SessionManager, type Message } from "./session.js";
 import { MemoryManager, type MemorySearchResult } from "./memory.js";
-import { ChannelToolManager, createDefaultChannelToolManager } from "./tools/channel-manager.js";
 import {
   ContextLoader,
   DEFAULT_CONTEXT_WINDOW_TOKENS,
@@ -156,14 +155,6 @@ export interface AgentConfig {
     manager?: any;
     /** 渠道配置 */
     config?: Record<string, any>;
-    /** 飞书工具配置 */
-    feishuTools?: {
-      doc?: boolean;
-      wiki?: boolean;
-      drive?: boolean;
-      perm?: boolean;
-      scopes?: boolean;
-    };
   };
   /**
    * Global lane 最大并发数（跨 session 的总并行度）
@@ -248,7 +239,6 @@ export class Agent {
   private context: ContextLoader;
   private skills: SkillManager;
   private heartbeat: HeartbeatManager;
-  private channelToolManager: ChannelToolManager;
 
   // 功能开关
   private enableMemory: boolean;
@@ -390,12 +380,6 @@ export class Agent {
       intervalMs: config.heartbeatInterval,
     });
 
-    // 初始化渠道工具管理器
-    this.channelToolManager = createDefaultChannelToolManager({
-      channelManager: config.channels?.manager,
-      feishuTools: config.channels?.feishuTools,
-    });
-
     // 功能开关
     this.enableMemory = config.enableMemory ?? true;
     this.enableContext = config.enableContext ?? true;
@@ -504,12 +488,6 @@ export class Agent {
       tools = tools.filter(
         (tool) => tool.name !== "memory_search" && tool.name !== "memory_get" && tool.name !== "memory_save",
       );
-    }
-
-    // 添加渠道工具
-    if (this.enableChannels && this.channelToolManager) {
-      const channelTools = this.channelToolManager.getAllTools();
-      tools.push(...channelTools);
     }
 
     // 对应 OpenClaw: isToolAllowedByPolicies() — 多策略交集（all must allow）
@@ -804,33 +782,33 @@ export class Agent {
           const checkToolApproval =
             this.approval && this.onApprovalRequest
               ? async (call: { id: string; name: string; input: unknown }) => {
-                  // deny 级别: 无条件拒绝，不提示（对齐 openclaw: ExecSecurity.deny）
-                  const security =
-                    this.approval!.tools?.[call.name] ?? this.approval!.security ?? "full";
-                  if (security === "deny") {
-                    return { approved: false, decision: "deny" };
-                  }
-
-                  const needed = requiresApproval({
-                    toolName: call.name,
-                    config: this.approval!,
-                    allowlist: this.allowlist.getAll(),
-                  });
-                  if (!needed) return null;
-
-                  const decision: ApprovalDecision = await this.onApprovalRequest!({
-                    toolCallId: call.id,
-                    toolName: call.name,
-                    args: call.input,
-                  });
-                  if (decision === "allow-always") {
-                    this.allowlist.add(call.name);
-                  }
-                  return {
-                    approved: decision !== "deny",
-                    decision,
-                  };
+                // deny 级别: 无条件拒绝，不提示（对齐 openclaw: ExecSecurity.deny）
+                const security =
+                  this.approval!.tools?.[call.name] ?? this.approval!.security ?? "full";
+                if (security === "deny") {
+                  return { approved: false, decision: "deny" };
                 }
+
+                const needed = requiresApproval({
+                  toolName: call.name,
+                  config: this.approval!,
+                  allowlist: this.allowlist.getAll(),
+                });
+                if (!needed) return null;
+
+                const decision: ApprovalDecision = await this.onApprovalRequest!({
+                  toolCallId: call.id,
+                  toolName: call.name,
+                  args: call.input,
+                });
+                if (decision === "allow-always") {
+                  this.allowlist.add(call.name);
+                }
+                return {
+                  approved: decision !== "deny",
+                  decision,
+                };
+              }
               : undefined;
 
           const stream = runAgentLoop({
@@ -1013,55 +991,4 @@ export class Agent {
     return this.heartbeat;
   }
 
-  // ===== 渠道管理 =====
-
-  /**
-   * 获取渠道工具管理器
-   */
-  getChannelToolManager(): ChannelToolManager {
-    return this.channelToolManager;
-  }
-
-  /**
-   * 设置渠道管理器
-   */
-  setChannelManager(channelManager: any): void {
-    this.channelToolManager.setChannelManager(channelManager);
-    this.enableChannels = true;
-  }
-
-  /**
-   * 添加渠道
-   */
-  addChannel(channelType: string, channel: any): void {
-    this.channelToolManager.addChannel(channelType, channel);
-    this.enableChannels = true;
-  }
-
-  /**
-   * 启用渠道功能
-   */
-  enableChannelTools(enabled: boolean = true): void {
-    this.enableChannels = enabled;
-  }
-
-  /**
-   * 获取渠道工具统计
-   */
-  getChannelToolStats(): any {
-    return this.channelToolManager.getToolStats();
-  }
-
-  /**
-   * 更新飞书工具配置
-   */
-  updateFeishuToolsConfig(config: Partial<{
-    doc?: boolean;
-    wiki?: boolean;
-    drive?: boolean;
-    perm?: boolean;
-    scopes?: boolean;
-  }>): void {
-    this.channelToolManager.updateFeishuToolsConfig(config);
-  }
 }
