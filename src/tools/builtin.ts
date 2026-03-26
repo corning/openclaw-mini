@@ -647,10 +647,6 @@ export const sessionsSpawnTool: Tool<{
   },
 };
 
-// ============== 渠道工具 ==============
-
-import { channelTools } from "./channel.js";
-
 // ============== 交易工具 ==============
 
 import { traderTools } from "./trader.js";
@@ -688,6 +684,5 @@ export const builtinTools: Tool[] = [
   memoryGetTool,
   memorySaveTool,
   sessionsSpawnTool,
-  ...channelTools,
   ...traderTools,
 ];
