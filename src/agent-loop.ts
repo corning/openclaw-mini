@@ -91,6 +91,20 @@ export interface AgentLoopParams {
     summary?: string;
     summaryMessage?: Message;
   }>;
+  /**
+   * 工具审批检查
+   *
+   * 对应 OpenClaw: bash-tools.exec.ts → requiresExecApproval() + waitForDecision()
+   * - 每个工具执行前调用
+   * - 返回 null: 无需审批，直接执行
+   * - 返回 { approved: true }: 审批通过
+   * - 返回 { approved: false }: 审批拒绝
+   */
+  checkToolApproval?: (call: {
+    id: string;
+    name: string;
+    input: unknown;
+  }) => Promise<{ approved: boolean; decision: string } | null>;
   /** 外部 abort 信号 */
   abortSignal: AbortSignal;
 }
@@ -364,6 +378,56 @@ export function runAgentLoop(params: AgentLoopParams): EventStream<MiniAgentEven
             });
 
             if (tool) {
+              // 审批检查（对齐 openclaw: exec-approvals → requiresExecApproval + waitForDecision）
+              if (params.checkToolApproval) {
+                const approval = await params.checkToolApproval(call);
+                if (approval !== null) {
+                  const decision = approval.decision as "allow-once" | "allow-always" | "deny";
+                  stream.push({
+                    type: "tool_approval_request",
+                    toolCallId: call.id,
+                    toolName: call.name,
+                    args: call.input,
+                  });
+                  stream.push({
+                    type: "tool_approval_resolved",
+                    toolCallId: call.id,
+                    toolName: call.name,
+                    decision,
+                  });
+                  if (!approval.approved) {
+                    result = "Tool execution denied by user.";
+                    totalToolCalls++;
+                    stream.push({
+                      type: "tool_execution_end",
+                      toolCallId: call.id,
+                      toolName: call.name,
+                      result,
+                      isError: true,
+                    });
+                    toolResults.push({
+                      type: "tool_result",
+                      tool_use_id: call.id,
+                      name: call.name,
+                      content: result,
+                    });
+                    // 审批拒绝后继续检查 steering
+                    const steering = await getSteeringMessages();
+                    if (steering.length > 0) {
+                      steeringMessages = steering;
+                      const remaining = toolCalls.slice(i + 1);
+                      for (const skipped of remaining) {
+                        stream.push({ type: "tool_skipped", toolCallId: skipped.id, toolName: skipped.name });
+                        toolResults.push(skipToolCall(skipped));
+                      }
+                      stream.push({ type: "steering", pendingCount: steering.length });
+                      break;
+                    }
+                    continue;
+                  }
+                }
+              }
+
               try {
                 result = await tool.execute(call.input, toolCtx);
               } catch (err) {

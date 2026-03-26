@@ -51,6 +51,10 @@ import {
 } from "./session-key.js";
 import { enqueueInLane, resolveGlobalLane, resolveSessionLane, setLaneConcurrency } from "./command-queue.js";
 import { filterToolsByPolicy, type ToolPolicy } from "./tool-policy.js";
+import {
+  requiresApproval, AllowlistManager,
+  type ApprovalConfig, type ApprovalHandler, type ApprovalDecision,
+} from "./tool-approval.js";
 import type { MiniAgentEvent } from "./agent-events.js";
 import { runAgentLoop } from "./agent-loop.js";
 import { installSessionToolResultGuard } from "./session-tool-result-guard.js";
@@ -98,6 +102,22 @@ export interface AgentConfig {
   tools?: Tool[];
   /** 工具策略（allow/deny） */
   toolPolicy?: ToolPolicy;
+  /**
+   * 工具审批配置
+   *
+   * 对应 OpenClaw: exec-approvals.ts → ExecSecurity + ExecAsk
+   * - 运行时拦截敏感工具执行，等待用户审批
+   * - 与 toolPolicy 互补: policy 是静态过滤，approval 是运行时拦截
+   */
+  approval?: ApprovalConfig;
+  /**
+   * 审批处理器
+   *
+   * 对应 OpenClaw: exec-approval-manager.ts → waitForDecision()
+   * - CLI 模式: readline 提示用户
+   * - Gateway 模式: 广播到客户端等待响应
+   */
+  onApprovalRequest?: ApprovalHandler;
   /** 沙箱设置（示意版，仅控制工具可用性） */
   sandbox?: {
     enabled?: boolean;
@@ -212,6 +232,9 @@ export class Agent {
   private maxTurns: number;
   private workspaceDir: string;
   private toolPolicy?: ToolPolicy;
+  private approval?: ApprovalConfig;
+  private onApprovalRequest?: ApprovalHandler;
+  private allowlist: AllowlistManager;
   private contextTokens: number;
   private sandbox?: {
     enabled: boolean;
@@ -345,6 +368,9 @@ export class Agent {
     this.temperature = config.temperature;
     this.reasoning = config.reasoning ?? "medium";
     this.toolPolicy = config.toolPolicy;
+    this.approval = config.approval;
+    this.onApprovalRequest = config.onApprovalRequest;
+    this.allowlist = new AllowlistManager();
     this.contextTokens = Math.max(
       1,
       Math.floor(config.contextTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS),
@@ -774,6 +800,39 @@ export class Agent {
             }));
           };
 
+          // 组合审批检查函数（对齐 openclaw: bash-tools.exec.ts → approval flow）
+          const checkToolApproval =
+            this.approval && this.onApprovalRequest
+              ? async (call: { id: string; name: string; input: unknown }) => {
+                  // deny 级别: 无条件拒绝，不提示（对齐 openclaw: ExecSecurity.deny）
+                  const security =
+                    this.approval!.tools?.[call.name] ?? this.approval!.security ?? "full";
+                  if (security === "deny") {
+                    return { approved: false, decision: "deny" };
+                  }
+
+                  const needed = requiresApproval({
+                    toolName: call.name,
+                    config: this.approval!,
+                    allowlist: this.allowlist.getAll(),
+                  });
+                  if (!needed) return null;
+
+                  const decision: ApprovalDecision = await this.onApprovalRequest!({
+                    toolCallId: call.id,
+                    toolName: call.name,
+                    args: call.input,
+                  });
+                  if (decision === "allow-always") {
+                    this.allowlist.add(call.name);
+                  }
+                  return {
+                    approved: decision !== "deny",
+                    decision,
+                  };
+                }
+              : undefined;
+
           const stream = runAgentLoop({
             runId,
             sessionKey,
@@ -791,6 +850,7 @@ export class Agent {
             maxTurns: this.maxTurns,
             contextTokens: this.contextTokens,
             getSteeringMessages,
+            checkToolApproval,
             appendMessage: (sk, msg) => this.sessions.append(sk, msg),
             prepareCompaction: async (p) => {
               const r = await this.prepareMessagesForRun(p);
