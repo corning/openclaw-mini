@@ -147,15 +147,6 @@ export interface AgentConfig {
   heartbeatInterval?: number;
   /** 上下文窗口大小（token 估算） */
   contextTokens?: number;
-  /** 渠道管理器配置 */
-  channels?: {
-    /** 是否启用渠道管理器 */
-    enabled?: boolean;
-    /** 渠道管理器实例 */
-    manager?: any;
-    /** 渠道配置 */
-    config?: Record<string, any>;
-  };
   /**
    * Global lane 最大并发数（跨 session 的总并行度）
    *
@@ -245,7 +236,6 @@ export class Agent {
   private enableContext: boolean;
   private enableSkills: boolean;
   private enableHeartbeat: boolean;
-  private enableChannels: boolean;
 
   /**
    * 运行中的 AbortController 映射 (runId → controller)
@@ -385,7 +375,6 @@ export class Agent {
     this.enableContext = config.enableContext ?? true;
     this.enableSkills = config.enableSkills ?? true;
     this.enableHeartbeat = config.enableHeartbeat ?? false;
-    this.enableChannels = config.channels?.enabled ?? false;
 
     // Global lane 并发数（对应 OpenClaw: DEFAULT_AGENT_MAX_CONCURRENT = 4）
     const globalLane = resolveGlobalLane();
@@ -990,5 +979,4 @@ export class Agent {
   getHeartbeat(): HeartbeatManager {
     return this.heartbeat;
   }
-
 }
